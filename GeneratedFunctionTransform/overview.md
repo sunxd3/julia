@@ -4,11 +4,7 @@
 
 An advanced use pattern is to be functionally equivalent to eval-ing functions at runtime. This is for metaprogramming packages: they build programs out of other programs, usually at the level of typed IR, and need the result to run as an ordinary function.
 
-Some examples. Mooncake translates a Julia function into a function that takes the tangent-type mapping of the original input types, and replaces the original functions with rules; this requires doing the transform at the IR level and then registering the derived function as a new function to run. Libtask rewrites IR so that every intermediate value lives in a `Ref`, which makes a suspended computation copyable. DAECompiler compiles a model into the right-hand side of an ODE through a series of IR transforms. A probabilistic-programming front end builds an expression at runtime and wants it compiled and callable from precompiled code.
-
-Doing this with `Core.eval` and `invokelatest` pays for a new method definition each time: a world-age increment, an invalidation scan, an untyped call, and nothing that can be precompiled.
-
-What these packages hold is typed IR: a compiler's output, containing decisions made under a particular set of definitions.
+Some examples. Mooncake translates a Julia function into a function that takes the tangent-type mapping of the original input types, and replaces the original functions with rules; this requires doing the transform at the IR level and then registering the derived function as a new function to run.
 
 ## 2. The opaque closure
 
@@ -27,13 +23,13 @@ The environment is a tuple; its type is the IR's first argument type and the bod
 
 To see the challenges the opaque closure needs to solve, let's recap Julia's world age and method table. A user writes methods; methods get specialized; because methods call other methods, all the compiled code needs to be compatible to be correct. The key data structures are `Method`, `MethodInstance` and `CodeInstance`.
 
-A `Method` is a definition. A `MethodInstance` is a method specialized to concrete argument types, `g(::Int64)`; there is one per method and argument tuple, shared by everyone who compiles it. A `CodeInstance` is one compiled result for a `MethodInstance`: return type, effects, world range, forward edges, native code. Several can hang on one `MethodInstance`, each with an `owner` saying which compiler produced it; `nothing` is Julia's own.
+A `Method` is a definition. A `MethodInstance` is a method specialized to concrete argument types, `g(::Int64)`; there is one per method and argument tuple, shared by everyone who compiles it. A `CodeInstance` is one compiled result for a `MethodInstance`: return type, effects, world range, forward edges, native code. Several can hang on one `MethodInstance`, each with an `owner` saying which compiler produced it.
 
 Every definition increments the world counter. Every `CodeInstance` records the range of worlds in which its assumptions hold. When inference of `caller` relies on `callee`, the caller's instance gets a forward edge to the callee's and the callee's `MethodInstance` gets a backedge. Redefining `callee` walks the backedges and caps `max_world` on every dependent instance. Nothing is recompiled then; the next call from a newer world finds no valid instance and compiles again. A fresh instance is valid from its world into every future world until an edge caps it.
 
 `IRCode` is the optimizer's working form: the `CodeInfo` is converted to SSA form, the passes run, and it is converted back into a `CodeInfo` for the `CodeInstance`. It carries a copy of the world range it was created with, which nothing updates. The packages call `typeinf_ircode` to get it and have no supported way to turn a modified copy back into a `CodeInstance`.
 
-## 4. What the closure exposes
+## 4. What opaque closure exposes
 
 The whole interface of an opaque closure is its type, `OpaqueClosure{Args, R}`; the world age is stored in the object and not checked.
 
@@ -48,7 +44,7 @@ oc_static(1), oc_dynamic(1), h(1)              # 2, 2, 101
 
 The dynamic case shows the stored world is applied: dispatch inside the closure body happens in the closure's world and finds the old `h`. No error, because to the runtime nothing is wrong.
 
-## 5. Why this cannot be optimized away
+## 5. Compiler optimization can be obstructed with OC 
 
 When creation and call are in the same function, inference tracks the closure as a `PartialOpaque`, infers the body itself, and the optimizer inlines the call and removes the closure: `oc = @opaque (x::Int) -> h(x) * a; oc(b)` compiles to two intrinsics. Nothing was trusted; the compiler re-derived everything in the caller's world.
 
@@ -102,7 +98,7 @@ A generator runs only for concrete argument types, so a caller that does not kno
 
 ## 8. Soundness
 
-Every risk has the same shape: a place where the runtime assumed one compiler, or one derivation, per `MethodInstance`. Three such places were broken.
+Julia main seems to have some unsound logic, the code changes on this branch fix them.
 
 The inliner's `compileable_specialization` replaced a given `CodeInstance` with whatever the current compiler's cache held for the same `MethodInstance`. With two owners on one chain that substituted Julia's code for the tool's, silently. It now keeps the given instance when the owner differs.
 
@@ -182,5 +178,3 @@ overdub(IRFn{:g}(), 2) = -98000
 ```
 
 The old instance is capped and left on the chain, a new one is derived on the next call, Julia's own is untouched.
-
-Three things went wrong while building this. The `@generated` macro cannot return a `CodeInfo`: its stub wraps the result in `Expr(:return, ...)` (`base/expr.jl:1883-1900`), so the `CodeInfo` became a literal; a `CodeInfo` body needs the raw protocol `gen(world, source, static_params..., argtypes...)`. The IR's world range is a snapshot: `code_ircode` left a provisional `max_world`, and copying it onto the body made inference fail with "invalid age range update". Inference mutates the `CodeInfo` it is given: the first compiler turned `ssavaluetypes` from a count into a vector and the second received a half-inferred object, so the generator must return a fresh copy.
