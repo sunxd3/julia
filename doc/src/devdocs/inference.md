@@ -113,3 +113,40 @@ map(f, t::Tuple{Any}) @ Base tuple.jl:358
 ```
 
 The line costs are in the left column. This includes the consequences of inlining and other forms of optimization.
+
+## Generated functions driven by a custom interpreter
+
+A `@generated` method normally obtains its body from a `Core.GeneratedFunctionStub`, i.e.
+from user code that returns an expression. `Core.GeneratedFunctionTransform` is an
+alternative generator whose body comes from running a custom `AbstractInterpreter`
+(see `Compiler/src/generators.jl`):
+
+1. The runtime calls the generator with the requesting world and the argument types of
+   the specialization, exactly as for any other generator (`jl_code_for_staged`).
+2. The generator maps the argument tuple type through `transform`, looks the resulting
+   signature up in the method table of `gen(world)`, and runs `typeinf_ext_toplevel` on
+   that `MethodInstance` with the custom interpreter. The result is a `CodeInstance`
+   owned by that interpreter's `cache_owner`, compiled through its `codegen_cache`.
+3. The returned `CodeInfo` is a stub of the form `invoke(f, ci, args...)` whose `edges`
+   contain `ci`. Inference of a caller resolves `invoke` with a `CodeInstance` argument to
+   `InvokeCICallInfo`, and the inlining pass lowers it to an `:invoke` of exactly that
+   instance (`compileable_specialization` never substitutes an instance with a different
+   owner). When the stub's edges are stored, the `CodeInstance` edge becomes a backedge on
+   its `MethodInstance`, both in `store_backedges` and in the C decoder used for
+   `CachedGenerator`s, so redefinitions that invalidate the inner result also invalidate
+   the callers and cause the generator to run again.
+
+As for every generator, the runtime pins the world to the generated method's
+`primary_world` while `transform` and `gen` run (`invoke_in_world` is a no-op inside
+such callbacks), so those two are fixed by the method definition; the lookup and the
+inner inference use the requesting world explicitly. If the interpreter belongs to a
+`Compiler` loaded separately from the one in the system image, the work is delegated to
+that module's `generate_transformed_body`. Note that the runtime has no backedges for
+method tables other than the global one, so a method added to an overlay table later
+does not invalidate anything inferred against it; this applies to the lookup done here
+just as much as to the inner inference. The outer inference treats the generated
+method like any other generated function: with abstract argument types it is only
+invoked for dispatch tuples (`may_invoke_generator`), and it is excluded from the
+`method_for_inference_heuristics` probe because running a full inner inference is not
+a cheap heuristic.
+

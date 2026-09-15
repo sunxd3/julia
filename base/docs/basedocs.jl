@@ -4258,6 +4258,60 @@ The current differences are:
 Core.finalizer
 
 """
+    Core.GeneratedFunctionTransform(transform, gen)
+
+A generator for a [`@generated`](@ref) method whose body is produced by a custom
+`Compiler.AbstractInterpreter` instead of by user code returning an expression.
+When a specialization of the generated method is needed, the runtime
+
+1. collects the argument types of the call, excluding the generated function itself,
+   as a tuple type `argtypes` and computes `lookup = transform(argtypes)`, the signature
+   of the call to transform; `transform` must preserve the number and order of the
+   arguments, since the generated method's own arguments are forwarded to it positionally;
+2. constructs `interp = gen(world)::Compiler.AbstractInterpreter` for the requesting
+   `world`, and runs inference and optimization of the method matching `lookup` with it;
+3. returns a body that `invoke`s the resulting `CodeInstance`, recording that instance
+   as an edge so that the body is regenerated whenever the inner result is invalidated.
+
+Like the body of any generated function, `transform` and `gen` run in the world in which
+the generated method was defined and must be pure functions of their arguments: what
+they call is not tracked, and redefining them later only affects generated methods
+defined afterwards. Only the inference they set up happens in the requesting `world`.
+`gen` must return an interpreter whose `Compiler.get_inference_world` is `world` and
+whose `Compiler.cache_owner` is not `nothing`.
+
+A transformed body may call the generated method again, for a callee whose transformed
+body in turn reaches the first (any recursive callee does this). A request for a
+specialization whose body is already being generated fails rather than recursing; that one
+call is then compiled without knowledge of its result, and at run time it finds the finished
+body. Recursion
+inside a transformed body, a callee calling itself, is an ordinary inference cycle and needs
+no such handling.
+
+!!! note
+    Methods added to an overlay method table after a body was generated do not
+    invalidate it, because the runtime only keeps method-table backedges for the global
+    method table. This is a general limitation of `Compiler.OverlayMethodTable`, and
+    applies equally to the code inferred by the inner interpreter.
+
+```julia
+Base.Experimental.@MethodTable MT
+Base.Experimental.@overlay MT Base.sin(x::Float64) = 42.0
+
+struct MyInterp <: Compiler.AbstractInterpreter ... end  # uses `MT` as its method table
+@eval function overdub(f, args...)
+    \$(Expr(:meta, :generated_only))
+    \$(Expr(:meta, :generated, Core.GeneratedFunctionTransform(identity, world -> MyInterp(; world))))
+end
+overdub(sin, 1.0) # 42.0
+```
+
+!!! warning
+    This feature is experimental and its interface may change in future releases.
+"""
+Core.GeneratedFunctionTransform
+
+"""
     Core._task(f, size) -> Task
     Core._task(f, size, invoked) -> Task
 

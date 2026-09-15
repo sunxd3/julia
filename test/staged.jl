@@ -428,6 +428,35 @@ let mi = only(methods(doit54916)).specializations
     @test found
 end
 
+# A `CachedGenerator` may record a `CodeInstance` as a forward edge of the code it
+# returns; the runtime must turn it into a backedge on that instance's `MethodInstance`
+# instead of misreading it as an `invoke` signature pair
+struct GeneratorCIEdge <: Core.CachedGenerator end
+function (::GeneratorCIEdge)(world::UInt, source::Method, self, f, arg)
+    mi = Base.specialize_method(Base._which(Tuple{f, arg}; world))
+    interp = Base.Compiler.NativeInterpreter(world)
+    ci = Base.Compiler.typeinf_ext_toplevel(interp, mi, Base.Compiler.SOURCE_MODE_ABI)
+    src = generate_lambda_ex(world, source, (:doit_ciedge, :func, :arg), (), :(func(arg)))
+    src.edges = Core.svec(ci)
+    src.min_world = ci.min_world
+    src.max_world = ci.max_world
+    return src
+end
+ciedge_callee(x) = x + 1
+@eval function doit_ciedge(func, arg)
+    $(Expr(:meta, :generated, GeneratorCIEdge()))
+    $(Expr(:meta, :generated_only))
+end
+@test doit_ciedge(ciedge_callee, 1) == 2
+let mi = Base.method_instance(ciedge_callee, (Int,))
+    @test any(mi.backedges) do @nospecialize edge
+        edge isa Core.CodeInstance && edge.owner === :uninferred &&
+            Base.Compiler.get_ci_mi(edge).def.name === :doit_ciedge
+    end
+end
+ciedge_callee(x) = x + 2
+@test doit_ciedge(ciedge_callee, 1) == 3
+
 # Test that writing a bad cassette-style pass gives the expected error (#49715)
 function generator49715(world, source, self, f, tt)
     tt = Base.type_parameter(tt)

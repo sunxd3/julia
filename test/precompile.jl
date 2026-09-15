@@ -2147,6 +2147,57 @@ precompile_test_harness("custom MethodTable dispatch status") do load_path
     end
 end
 
+precompile_test_harness("GeneratedFunctionTransform invoke edge") do load_path
+    # A package image holding native code that `:invoke`s a CodeInstance owned by another
+    # interpreter (here produced by a `Core.GeneratedFunctionTransform` generator) must
+    # emit that CodeInstance's own code, not re-infer its MethodInstance natively.
+    newinterp_path = abspath(joinpath(@__DIR__, "../Compiler/test/newinterp.jl"))
+    write(joinpath(load_path, "GFTInvokeEdge.jl"),
+        """
+        module GFTInvokeEdge
+        import Base.Compiler: Compiler
+        include($(repr(newinterp_path)))
+        @newinterp GFTInvokeEdgeInterp
+        Base.Experimental.@MethodTable MT
+        Compiler.method_table(interp::GFTInvokeEdgeInterp) =
+            Compiler.OverlayMethodTable(Compiler.get_inference_world(interp), MT)
+        const CODEGEN = IdDict{Core.CodeInstance,Core.CodeInfo}()
+        Compiler.codegen_cache(::GFTInvokeEdgeInterp) = CODEGEN
+        const GEN_CALLS = Ref(0)
+        mkinterp(world::UInt) = (GEN_CALLS[] += 1; GFTInvokeEdgeInterp(; world))
+        leaf(x::Int) = x + 1
+        Base.Experimental.@overlay MT leaf(x::Int) = x - 1
+        target(x::Int) = leaf(x) * 10
+        @eval function overdub(f, args...)
+            \$(Expr(:meta, :generated_only))
+            \$(Expr(:meta, :generated, Core.GeneratedFunctionTransform(identity, mkinterp)))
+        end
+        caller(x::Int) = overdub(target, x) + 1
+        precompile(caller, (Int,))
+        end
+        """)
+    Base.compilecache(Base.PkgId("GFTInvokeEdge"))
+    @eval using GFTInvokeEdge
+    invokelatest() do
+        M = GFTInvokeEdge
+        @test M.GEN_CALLS[] == 1
+        mi = only(Base.specializations(only(methods(M.target))))
+        ci = check_presence(mi, M.GFTInvokeEdgeInterp)
+        @test ci !== nothing
+        # the foreign-owned CodeInstance got native code in the image
+        @test ci.invoke != C_NULL
+        @test M.caller(2) == 11
+        @test M.GEN_CALLS[] == 1 # the precompiled body was used, not regenerated
+        @test M.target(2) == 30
+        # invalidation of the inner CodeInstance still regenerates the body after load
+        Core.eval(M, :(target(x::Int) = leaf(x) * 100))
+        invokelatest() do
+            @test M.caller(2) == 101
+            @test M.GEN_CALLS[] == 2
+        end
+    end
+end
+
 precompile_test_harness("DynamicExpressions") do load_path
     # https://github.com/JuliaLang/julia/pull/47184#issuecomment-1364716312
     write(joinpath(load_path, "Float16MWE.jl"),

@@ -2130,6 +2130,13 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                 src = codeinfo_for_const(interp, mi, WorldRange(callee.min_world, callee.max_world), callee.edges, callee.rettype_const)
             else
                 src = get(interp.codegen, callee, nothing)
+                if src === nothing && callee.owner !== cache_owner(interp)
+                    # A CodeInstance owned by another interpreter (e.g. the target of an
+                    # `invoke(f, ci, args...)`) is not interchangeable with what we would
+                    # infer for its MethodInstance ourselves, so it must be emitted from
+                    # the optimized IR it retains rather than re-inferred under our owner.
+                    src = ci_get_source(interp, callee)
+                end
                 if src === nothing
                     newcallee = typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)
                     if newcallee isa CodeInstance

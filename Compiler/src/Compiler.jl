@@ -196,6 +196,7 @@ include("tfuncs.jl")
 include("abstractinterpretation.jl")
 include("typeinfer.jl")
 include("optimize.jl")
+include("generators.jl")
 
 include("bootstrap.jl")
 include("precompile.jl")

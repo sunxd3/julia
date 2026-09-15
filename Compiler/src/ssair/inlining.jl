@@ -807,7 +807,11 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     # A normalized compileable signature can have a less precise ABI for TypeEgal
     # arguments, forcing boxed argument passing for non-recursive invokes, so a
     # directly supplied inferred edge for the actual call signature wins there.
-    keep_direct_edge = code isa CodeInstance && mi !== mi_invoke && has_typeegal_slot(atype)
+    # A CodeInstance produced under a different `cache_owner` (e.g. one handed to
+    # `invoke(f, ci, args...)` by another AbstractInterpreter) is not interchangeable
+    # with what our own cache holds for the same MethodInstance, so it must be kept too.
+    keep_direct_edge = code isa CodeInstance && (code.owner !== cache_owner(state.interp) ||
+        (mi !== mi_invoke && has_typeegal_slot(atype)))
     if !keep_direct_edge
         cached = get(code_cache(state), mi_invoke, nothing)
         if cached isa CodeInstance

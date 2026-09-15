@@ -326,6 +326,7 @@ Base.@label
 Base.@simd
 Base.@polly
 Base.@generated
+Core.GeneratedFunctionTransform
 Base.@assume_effects
 ```
 

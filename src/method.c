@@ -874,22 +874,39 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
                 }
                 for (size_t i = 0; i < l; ) {
                     kind = data[i++];
-                    if (jl_is_method_instance(kind)) {
+                    if (jl_is_long(kind)) {
+                        // `nmatches, atype` lookup annotation: not itself a backedge,
+                        // the matches that follow are processed as ordinary edges
+                        assert(i < l);
+                        i++;
+                    }
+                    else if (jl_is_method(kind)) {
+                        continue; // ignore `Method`-edges (from e.g. failed `abstract_call_method`)
+                    }
+                    else if (jl_is_method_instance(kind)) {
                         jl_method_instance_add_backedge((jl_method_instance_t*)kind, jl_nothing, ci);
+                    }
+                    else if (jl_is_code_instance(kind)) {
+                        jl_method_instance_add_backedge(jl_get_ci_mi((jl_code_instance_t*)kind), jl_nothing, ci);
                     }
                     else if (jl_is_binding(kind)) {
                         jl_add_binding_backedge((jl_binding_t*)kind, (jl_value_t*)ci);
                     }
-                    else if (jl_is_mtable(kind)) {
-                        assert(i < l);
-                        ex = data[i++];
-                        if ((jl_methtable_t*)kind == jl_method_table)
-                            jl_method_table_add_backedge(ex, ci);
-                    }
                     else {
+                        // `invokesig, callee` pair, where callee is a MethodTable
+                        // (abstract dispatch), a MethodInstance or CodeInstance
+                        // (`invoke` edge), or a Method (ignored)
                         assert(i < l);
                         ex = data[i++];
-                        jl_method_instance_add_backedge((jl_method_instance_t*)ex, kind, ci);
+                        if (jl_is_mtable(ex)) {
+                            if ((jl_methtable_t*)ex == jl_method_table)
+                                jl_method_table_add_backedge(kind, ci);
+                        }
+                        else if (!jl_is_method(ex)) {
+                            if (jl_is_code_instance(ex))
+                                ex = (jl_value_t*)jl_get_ci_mi((jl_code_instance_t*)ex);
+                            jl_method_instance_add_backedge((jl_method_instance_t*)ex, kind, ci);
+                        }
                     }
                 }
             }

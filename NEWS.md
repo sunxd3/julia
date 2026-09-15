@@ -72,6 +72,14 @@ Language changes
 Compiler/Runtime improvements
 -----------------------------
 
+* `Core.GeneratedFunctionTransform` is a new kind of generator for `@generated` methods: instead of
+  returning an expression, it infers and compiles the wrapped call with a custom
+  `Compiler.AbstractInterpreter` and emits a body that `invoke`s the resulting `CodeInstance`,
+  giving contextual-dispatch and program-transformation tools a direct connection from an ordinary
+  call to their own compilation pipeline. `invoke(f, ci, args...)` now also always targets the given
+  `CodeInstance` even when the native cache holds code for the same specialization, including when
+  the calling code is stored in a package image, and generated code may record `CodeInstance`s as
+  edges.
 * Type inference now refines field types through conditional checks and call signatures.
   For example, after `if !isnothing(x.field)`, inference knows `x.field` is not `nothing` within the branch.
   Similarly, after a call like `func(x.field)` where `func(::Int)` is the only matching method, inference

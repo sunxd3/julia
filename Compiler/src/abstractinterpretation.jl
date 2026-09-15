@@ -848,7 +848,10 @@ end
 
 # This function is used for computing alternate limit heuristics
 function method_for_inference_heuristics(method::Method, @nospecialize(sig), sparams::SimpleVector, world::UInt)
+    # `GeneratedFunctionTransform` runs a full inner inference, which is far too expensive
+    # for a heuristic probe, and its result carries no `method_for_inference_limit_heuristics`.
     if (hasgenerator(method) && !(method.generator isa Core.GeneratedFunctionStub) &&
+        !(method.generator isa Core.GeneratedFunctionTransform) &&
         may_invoke_generator(method, sig, sparams))
         mi = specialize_method(method, sig, sparams)
         cinfo = get_staged(mi, world)
