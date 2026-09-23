@@ -1,6 +1,6 @@
 # Bugs in Julia found while building `Core.GeneratedFunctionTransform`
 
-Ten bugs in the runtime and compiler, none caused by the feature. They came up while building `Core.GeneratedFunctionTransform`, an interpreter-backed generator. Bugs 1-6 were found while building the branch (reproduced 2026-09-17). Bugs 7-10 came out of the audit rounds on 2026-09-21. The current release is Julia 1.13.0. Every self-contained reproducer in [`repro/`](repro/) was run against 1.13.0 and against a build carrying the fixes, and its real output was captured in its header (2026-09-21/22). On 1.13.0: all four decoder variants crash or hang (bug 1); the no-copy and stale-world cases raise internal errors (bugs 2 and 3); the ping/pong generator recursion overflows the stack and then hangs, or sometimes recovers (bug 10). The fix for bugs 5, 6, 8 and 9 was verified on 2026-09-22. Line numbers are against `ca626376c0` unless stated. Where the text says "master", it means `55312b3c97` (2026-09-21), which is also the base of the rebuilt feature branch.
+Ten bugs in the runtime and compiler, none caused by the feature. They came up while building `Core.GeneratedFunctionTransform`, an interpreter-backed generator. Bugs 1-6 were found while building the branch (reproduced 2026-09-17). Bugs 7-10 came out of the audit rounds on 2026-09-21. The current release is Julia 1.13.0. Each bug was reproduced on 1.13.0 and on a build carrying the fixes (2026-09-21/22). On 1.13.0: all four decoder variants crash or hang (bug 1); the no-copy and stale-world cases raise internal errors (bugs 2 and 3); the ping/pong generator recursion overflows the stack and then hangs, or sometimes recovers (bug 10). The fix for bugs 5, 6, 8 and 9 was verified on 2026-09-22. Line numbers are against `ca626376c0` unless stated. Where the text says "master", it means `55312b3c97` (2026-09-21), which is also the base of the rebuilt feature branch.
 
 There are two themes. Bugs 1-3 and 10 are in the generated-function protocol, and plain user code on released Julia can reach them. Bugs 4-9 all come from assuming that a `MethodInstance` has only one compiler. You reach them through `invoke(f, ci, args...)` (JuliaLang/julia#56660) with a `CodeInstance` from an external `AbstractInterpreter`. Bug 4 gives a silent wrong answer on the 1.13.0 release. Bugs 5, 8 and 9 need master: on 1.13.0, bug 4 inlines the native body before a foreign `:invoke` can reach them.
 
@@ -22,7 +22,7 @@ Commit hashes are not final, so this document refers to commits by title. The fe
 | 3 | generator world range not validated | 1.12.7, 1.13.0 | patch in Appendix A |
 | 4 | inliner swaps a foreign `CodeInstance` | **1.13.0** (native body inlined) and master; not 1.12.7 | master: (2) `inlining: Keep a foreign-owned CodeInstance as the invoke target`; 1.13: unfixed |
 | 5 | `compile!` re-infers a foreign target | master | (6) `Compiler: Do not re-infer a foreign-owned invoke target natively` |
-| 6 | `emit_tojlinvoke` fallback dispatches by `MethodInstance` (AOT) | master (via `repro/review-pkgs/BigEphNR.jl`) | (5) `codegen: Never dispatch a foreign-owned CodeInstance by MethodInstance`, plus the `needsparams` arm |
+| 6 | `emit_tojlinvoke` fallback dispatches by `MethodInstance` (AOT) | master | (5) `codegen: Never dispatch a foreign-owned CodeInstance by MethodInstance`, plus the `needsparams` arm |
 | 7 | `owner === Nothing` typo in `abstract_invoke` | 1.13.0, master | (3) `inference: Do not infer invoke of a foreign CodeInstance as nothrow` |
 | 8 | wrong-owner cache insert asserts | master | (6) `Compiler: Do not re-infer a foreign-owned invoke target natively` |
 | 9 | `add_codeinsts_to_jit!` + JIT trampoline swap | master | trampoline: (5) `codegen: ...`; driver: (6) `Compiler: ...` |
@@ -33,7 +33,7 @@ The last row is not a bug in the same sense. If you add an overlay method *after
 
 ## 1. The C backedge decoder in `jl_code_for_staged` is type-confused and segfaults
 
-Status: fixed by commit (1) `method: Fix the backedge decoder in jl_code_for_staged`. Independent of the feature; reproduces on 1.12.7 and 1.13.0, and master has the identical decoder. Reproducer: `repro/repro-01.jl` (variants `mt-cached`, `int-cached`, `ci-cached`, `mt-plain-min`).
+Status: fixed by commit (1) `method: Fix the backedge decoder in jl_code_for_staged`. Independent of the feature; reproduces on 1.12.7 and 1.13.0, and master has the identical decoder.
 
 `store_backedges` encodes a forward-edge list in five shapes:
 
@@ -68,7 +68,7 @@ g(1)
 ```
 
 - **1.12.7:** `signal 11 (1): Segmentation fault` in `ijl_array_grow_end` <- `push_edge` (`src/method.c:1071`) <- `ijl_method_instance_add_backedge` <- `ijl_code_for_staged`.
-- **1.13.0:** the same crash with `push_edge` at `src/method.c:1140` and `ijl_code_for_staged` at `:881` (`repro-01.jl`, variant `mt-cached`). A bare `CodeInstance` edge (`ci-cached`) also segfaults.
+- **1.13.0:** the same crash with `push_edge` at `src/method.c:1140` and `ijl_code_for_staged` at `:881`. A bare `CodeInstance` edge also segfaults.
 - **`Int` lookup-marker variant (`int-cached`):** it hangs instead of crashing. It was killed after 180s on 1.12.7 and terminated after 60s on 1.13.0, stuck in `jl_mutex_lock` <- `ijl_method_instance_add_backedge`.
 - **Fixed build:** all four variants run and survive GC and an invalidation.
 
@@ -87,7 +87,7 @@ A better long-term fix is to not have two decoders. `jl_code_for_staged` would r
 
 ## 2. A generator's `CodeInfo` is handed to inference without being copied
 
-Status: not on the feature branch (the feature does not need it). The fix, a copy on entry, is preserved in Appendix A. Reproduces on 1.12.7 and 1.13.0, and master has the same code. Reproducer: `repro/repro-02.jl`.
+Status: not on the feature branch (the feature does not need it). The fix, a copy on entry, is preserved in Appendix A. Reproduces on 1.12.7 and 1.13.0, and master has the same code.
 
 `jl_code_for_staged` returns `func`, the object the generator returned, to its caller (`src/method.c:927`; master `:910`). Along the way, `jl_resolve_definition_effects_in_ir` (`:821`) rewrites its statement array in place. Afterwards, inference overwrites `ssavaluetypes`, changing it from an `Int` to a `Vector`. Only the already-cached path really protects the caller: `:784` returns a copy of the cached body. The caching path's copy at `:855` goes *into* the cache. When the cache race is won, the object handed back is still the generator's own, so a `Core.CachedGenerator` returning a stored `CodeInfo` sees it mutated too.
 
@@ -119,7 +119,7 @@ Fix: `func = (jl_code_info_t*)jl_copy_ast(ex)` at master `:819`, before the firs
 
 ## 3. A generator's world range is validated too late and reported as an internal error
 
-Status: not on the feature branch (the feature does not need it). The fix is preserved in Appendix A. Reproduces on 1.12.7 and 1.13.0, and master has the same code. Reproducer: `repro/repro-03.jl` (run it both with and without `--compile=min`).
+Status: not on the feature branch (the feature does not need it). The fix is preserved in Appendix A. Reproduces on 1.12.7 and 1.13.0, and master has the same code.
 
 A generator may restrict the world range of its result by setting `min_world`/`max_world` on the returned `CodeInfo`. `jl_code_for_staged` validates one thing about that range (`src/method.c:846-850`): if `edges == nothing` and `max_world == typemax`, then `min_world` must be `1`. It does not check that the range contains the world the body was requested for. That is checked much later, when `InferenceState` applies the generated-function restriction (`Compiler/src/inferencestate.jl:446-449`) and calls `update_valid_age!`. That call throws `error("invalid age range update")` (`:1336`).
 
@@ -135,7 +135,7 @@ end
 
 Calling the method prints `Internal error: during type inference of stale(Int64)` / `ErrorException("invalid age range update")`, with an `update_valid_age!` <- `InferenceState` <- `typeinf_ext` backtrace, and then recovers. The message names neither the generator nor the range. The same string is used at two other sites (master `inferencestate.jl:264` and `:498`), so the error alone is not enough to diagnose the problem.
 
-The interpreted path is worse. Under `--compile=min` nothing checks the range at all. The uninferred instance takes the generator's bounds, `jl_cached_uninferred` then never matches, and the stale body simply runs and returns. So the check has to live in `jl_code_for_staged`, the one place all three callers pass through (`src/interpreter.c:891`, `Compiler/src/utilities.jl:103/108`, `base/reflection.jl:34`). A better message on the Julia side would miss the interpreted path. With the fix, both paths raise `Generated function stale returned code valid for worlds [1, 2], which does not include the requested world 43046`. The world number differs between runs; the captured output in `repro-03.jl` shows 43042.
+The interpreted path is worse. Under `--compile=min` nothing checks the range at all. The uninferred instance takes the generator's bounds, `jl_cached_uninferred` then never matches, and the stale body simply runs and returns. So the check has to live in `jl_code_for_staged`, the one place all three callers pass through (`src/interpreter.c:891`, `Compiler/src/utilities.jl:103/108`, `base/reflection.jl:34`). A better message on the Julia side would miss the interpreted path. With the fix, both paths raise `Generated function stale returned code valid for worlds [1, 2], which does not include the requested world 43046`.
 
 This is easy to hit by accident. `IRCode.valid_worlds` is a snapshot: its `max_world` is the world counter at the time the IR was produced, not `typemax`. A tool pasting IR it already inferred will naturally copy that range onto the body, which gives exactly this error.
 
@@ -145,9 +145,9 @@ Fix: next to the existing check in `jl_code_for_staged`, check `min_world <= wor
 
 ## 4. `compileable_specialization` replaces a foreign `CodeInstance` with the native cache's
 
-Status: fixed on master by commit (2) `inlining: Keep a foreign-owned CodeInstance as the invoke target` (`Compiler/src/ssair/inlining.jl:810-814`). **This is also a silent wrong answer on the 1.13.0 release, by a different route that commit (2) does not cover. That route is unfixed.** 1.12.7 is unaffected. Reproducer: `repro/repro-04.jl`.
+Status: fixed on master by commit (2) `inlining: Keep a foreign-owned CodeInstance as the invoke target` (`Compiler/src/ssair/inlining.jl:810-814`). **This is also a silent wrong answer on the 1.13.0 release, by a different route that commit (2) does not cover. That route is unfixed.** 1.12.7 is unaffected.
 
-Both routes come from JuliaLang/julia#60442 (`e1dda38c51`, 2026-01-24), which made the optimizer rewrite `invoke(f, ci, args...)` into `Expr(:invoke, ci, ...)`. I measured all four builds with one script (`repro-04.jl`). It uses the overlay `leaf(x) = x - 1` against the native `x + 1`, so 10 is the right answer and 30 means the body was swapped:
+Both routes come from JuliaLang/julia#60442 (`e1dda38c51`, 2026-01-24), which made the optimizer rewrite `invoke(f, ci, args...)` into `Expr(:invoke, ci, ...)`. I measured all four builds with one script. It uses the overlay `leaf(x) = x - 1` against the native `x + 1`, so 10 is the right answer and 30 means the body was swapped:
 
 | Build | Result | What happens |
 |---|---|---|
@@ -170,9 +170,9 @@ With commit (2), `keep_direct_edge` also holds when `code.owner !== cache_owner(
 
 ## 5. The package-image driver re-infers a foreign `invoke` target natively
 
-Status: fixed by commit (6) `Compiler: Do not re-infer a foreign-owned invoke target natively`, together with bug 8 and the driver half of bug 9. The fix depends on commit (5) for what happens at run time. Reproduces on master; on 1.13.0 the same symptom appears, but through bug 4. Reproducers: `repro/repro-05.jl` (package-image round trip) and the five packages in `repro/review-pkgs/`.
+Status: fixed by commit (6) `Compiler: Do not re-infer a foreign-owned invoke target natively`, together with bug 8 and the driver half of bug 9. The fix depends on commit (5) for what happens at run time. Reproduces on master; on 1.13.0 the same symptom appears, but through bug 4.
 
-`compile!` looked an `:invoke` target up in `interp.codegen`, which is the **native** interpreter's codegen cache. On a miss, it called `typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)` (master `typeinfer.jl:2134-2144`). That re-infers the callee under the native owner and queues *that* instance in its place, while the foreign callee is only marked as inspected. The symptom: after the image is loaded, a precompiled `caller(2)` returns 31 (the native callee) instead of 11. `repro-05.jl` shows the same result on 1.13.0 and on master plus the bug 4 fix: after loading, `caller(2) = 31` and `fci.invoke == C_NULL`, while `invoke(target, fci, 2)` directly raises `Failed to invoke or compile external codeinst`. Run in-process, the driver emits `[(:caller2, nothing), (:target, nothing)]`: a native `target`, and `fci` is not in the emitted set.
+`compile!` looked an `:invoke` target up in `interp.codegen`, which is the **native** interpreter's codegen cache. On a miss, it called `typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)` (master `typeinfer.jl:2134-2144`). That re-infers the callee under the native owner and queues *that* instance in its place, while the foreign callee is only marked as inspected. The symptom: after the image is loaded, a precompiled `caller(2)` returns 31 (the native callee) instead of 11. A package-image round trip shows the same result on 1.13.0 and on master plus the bug 4 fix: after loading, `caller(2) = 31` and `fci.invoke == C_NULL`, while `invoke(target, fci, 2)` directly raises `Failed to invoke or compile external codeinst`. Run in-process, the driver emits `[(:caller2, nothing), (:target, nothing)]`: a native `target`, and `fci` is not in the emitted set.
 
 The source is available. The serializer keeps `ci.inferred` for foreign owners (`src/staticdata_utils.c:148`).
 
@@ -199,11 +199,7 @@ The owner test is `is_foreign_owned`, which treats the `:trim` owner as the nati
 
 Status: fixed by commit (5) `codegen: Never dispatch a foreign-owned CodeInstance by MethodInstance`. The fix is in the shared `emit_tojlinvoke` funnel, not in `aot_link_output` alone, so it also covers the JIT (bug 9). Review found a third site, the `needsparams` arm of `emit_invoke` (`src/codegen.cpp:6331`), and commit (5) fixes it the same way.
 
-Reproducers:
-
-- `repro/review-pkgs/BigEphNR.jl` reproduces this on pristine master. It uses a non-inlineable foreign instance kept off the `mi.cache` chain. The driver never enqueues that instance, so the image's caller links to the `!theFunc` branch of `emit_tojlinvoke` (`src/codegen.cpp:7779-7783`) and runs the native body (31).
-- `repro/repro-06.jl` shows only consistent symptoms. The bug 5 round trip leaves `fci.invoke == C_NULL` before and after `caller(2) = 31`, but that script cannot separate this fallback from bug 5.
-- `repro/sp.jl` exercises the `needsparams` arm.
+It reproduces on pristine master with a non-inlineable foreign instance kept off the `mi.cache` chain. The driver never enqueues that instance, so the image's caller links to the `!theFunc` branch of `emit_tojlinvoke` (`src/codegen.cpp:7779-7783`) and runs the native body (31).
 
 `aot_link_output` (`src/aotcompile.cpp:878-920`) resolves each call target in three steps:
 
@@ -221,7 +217,7 @@ These notes originally argued that the AOT path should fail at build time. Becau
 
 ## 7. `abstract_invoke` compares a `CodeInstance`'s owner against the type `Nothing`
 
-Status: fixed by commit (3) `inference: Do not infer invoke of a foreign CodeInstance as nothrow`. The line arrived with JuliaLang/julia#56660 (`efa917e877`), and `repro-07.jl` shows the bug on 1.13.0 as well as master. Reproducer: `repro/repro-07.jl`.
+Status: fixed by commit (3) `inference: Do not infer invoke of a foreign CodeInstance as nothrow`. The line arrived with JuliaLang/julia#56660 (`efa917e877`), and the bug shows on 1.13.0 as well as master.
 
 ```julia
 # TODO: When we add curing, we may want to assume this is nothrow
@@ -248,14 +244,14 @@ The fix is `method_or_ci.owner !== nothing`. It is conservative rather than exac
 
 ## 8. The compile drivers insert a foreign `CodeInstance` into the native cache and assert
 
-Status: fixed by commit (6) `Compiler: Do not re-infer a foreign-owned invoke target natively`. With it, a foreign instance is never inserted into `code_cache(interp)`, and an off-chain one is rooted through `jit_cache_root!(nothing, ci)`. Reproduces on master only. Reproducer: `repro/repro-08.jl` ([a] `compile!` in-process, [b] the JIT path, [c] a precompiled package).
+Status: fixed by commit (6) `Compiler: Do not re-infer a foreign-owned invoke target natively`. With it, a foreign instance is never inserted into `code_cache(interp)`, and an off-chain one is rooted through `jit_cache_root!(nothing, ci)`. Reproduces on master only.
 
 Both drain loops end with `code_cache(interp)[mi] = callee` when `jl_mi_cache_has_ci(mi, callee) == 0` and `find_equivalent_cached_ci` finds nothing:
 
 - `compile!` (package images) at `Compiler/src/typeinfer.jl:2162`, which is master `:2157`;
 - `add_codeinsts_to_jit!` (the JIT) at `:2054`, which is master `:2056`.
 
-`setindex!` asserts `ci.owner === cache.owner` (`Compiler/src/cicache.jl:45`), and `@assert` is always live in Julia. Take an interpreter whose cache is not on the `MethodInstance` chain, such as `@newinterp X true`, an ephemeral `IdDict`. The instance is not found on the chain, so the insert is reached, and it raises an `AssertionError`. During precompilation, that error is fatal to the package. On master, `repro-08.jl` gives:
+`setindex!` asserts `ci.owner === cache.owner` (`Compiler/src/cicache.jl:45`), and `@assert` is always live in Julia. Take an interpreter whose cache is not on the `MethodInstance` chain, such as `@newinterp X true`, an ephemeral `IdDict`. The instance is not found on the chain, so the insert is reached, and it raises an `AssertionError`. During precompilation, that error is fatal to the package. On master this gives:
 
 - [a] `AssertionError` from `compile!`;
 - [b] an `AssertionError` from `add_codeinsts_to_jit!`. When reached through `jl_type_infer`, it shows up as `Internal error: during type inference of eph_caller(Int64)`, followed by `eph_caller(2) = 30`, the native body.
@@ -267,8 +263,8 @@ On 1.13.0 all three cases pass. That is not because the insert is guarded: the 1
 
 Whether the feature's partial `compile!` fix (§5) opened this depends on the configuration. Both earlier statements of it in these notes were half right.
 
-- **Uncompiled ephemeral instance: pre-existing.** When `collectinvokes!` probes the edge (`:1913`), `ci_has_source` writes the foreign source into the native codegen cache (`typeinfer.jl:1563`). So the old `get(interp.codegen, callee, nothing)` already finds source and reaches the insert. `repro-08.jl` reproduces this through the real driver.
-- **Already compiled instance: opened by the partial fix.** Here `ci_has_invoke(edge)` short-circuits that probe, and the native codegen cache stays empty. Before the feature's partial fix, the code fell into native re-inference, the silent swap of bug 5. The partial fix's `ci_get_source` supplied source instead, reached the insert, and turned the silent wrong answer into a hard precompile error. I reproduced this with a bare `invoke(f, ci, x)` package and no generator: `repro/pkgs/ForeignInvokeEph.jl`, built with the feature's partial fix. On pristine master, that package takes the native re-inference path instead.
+- **Uncompiled ephemeral instance: pre-existing.** When `collectinvokes!` probes the edge (`:1913`), `ci_has_source` writes the foreign source into the native codegen cache (`typeinfer.jl:1563`). So the old `get(interp.codegen, callee, nothing)` already finds source and reaches the insert.
+- **Already compiled instance: opened by the partial fix.** Here `ci_has_invoke(edge)` short-circuits that probe, and the native codegen cache stays empty. Before the feature's partial fix, the code fell into native re-inference, the silent swap of bug 5. The partial fix's `ci_get_source` supplied source instead, reached the insert, and turned the silent wrong answer into a hard precompile error. I reproduced this with a bare `invoke(f, ci, x)` package and no generator, built with the feature's partial fix. On pristine master, that package takes the native re-inference path instead.
 
 On-chain foreign caches (`InternalCodeCache(owner)`) skip the insert, which is why only ephemeral caches show the assertion.
 
@@ -278,17 +274,17 @@ Fix: insert only when `callee.owner === cache_owner(interp)`, and root a foreign
 
 ## 9. The JIT re-infers a foreign target natively, and its trampoline dispatches by `MethodInstance`
 
-Status: fixed in two halves. Commit (6) `Compiler: Do not re-infer a foreign-owned invoke target natively` makes `add_codeinsts_to_jit!` emit a foreign instance from its own source, or skip it. Commit (5) `codegen: Never dispatch a foreign-owned CodeInstance by MethodInstance` makes the trampoline hand the instance to `jl_invoke_codeinst`. Reproduces on master only. Reproducers: `repro/repro-09.jl`; `repro/owner_repro.jl`, case C (cases A-D cover the JIT and driver paths for ephemeral and on-chain foreign instances); and `repro/nocodegen.jl`, the builtin-only variant.
+Status: fixed in two halves. Commit (6) `Compiler: Do not re-infer a foreign-owned invoke target natively` makes `add_codeinsts_to_jit!` emit a foreign instance from its own source, or skip it. Commit (5) `codegen: Never dispatch a foreign-owned CodeInstance by MethodInstance` makes the trampoline hand the instance to `jl_invoke_codeinst`. Reproduces on master only.
 
 `add_codeinsts_to_jit!` (`Compiler/src/typeinfer.jl:2032-2043`; master `:2034-2044`) is the run-time twin of bug 5. On a `ci_get_source` miss, it calls `typeinf_ext(workqueue.interp, callee.def, source_mode)` with no owner test. The caller's IR still `:invoke`s the foreign instance, which the JIT never compiled. So `JuliaOJIT::linkCallTarget` falls through to `JLTrampolineMaterializationUnit`, then to `emit_tojlinvoke(CI, "", Out)` (`src/jitlayers.cpp:1194`), and finally to the same `jl_invoke(args, nargs, mi)` branch as bug 6.
 
-`repro-09.jl` puts a foreign instance on the chain and clears its source, as happens after an image load or cache trimming. The compiled caller returns 30, the native body, while `invoke(target, own_ci, 2)` on the *same* instance throws `Failed to invoke or compile external codeinst`, and `own_ci.invoke` stays `C_NULL`. The compiled and interpreted paths disagree about one object. 1.13.0 also prints 30, but by bug 4's route. The feature's own instances escaped this only because they already have `invoke` set when they reach the loop (`ci_has_invoke` at `:2020`).
+Put a foreign instance on the chain and clear its source, as happens after an image load or cache trimming. The compiled caller returns 30, the native body, while `invoke(target, own_ci, 2)` on the *same* instance throws `Failed to invoke or compile external codeinst`, and `own_ci.invoke` stays `C_NULL`. The compiled and interpreted paths disagree about one object. 1.13.0 also prints 30, but by bug 4's route. The feature's own instances escaped this only because they already have `invoke` set when they reach the loop (`ci_has_invoke` at `:2020`).
 
 Expected: the compiled caller behaves like the builtin. It either throws or runs the foreign body, never the native one.
 
 ## 10. A generator that infers code can re-enter its own generation without bound
 
-Status: fixed by commit (4) `method: Bound re-entrant generation of a MethodInstance`. Reproduces on 1.12.7 and 1.13.0 with nothing but `Base.Compiler.NativeInterpreter`; master has no guard either. Reproducer: `repro/repro-10.jl` (variants `capped` and `uncapped`).
+Status: fixed by commit (4) `method: Bound re-entrant generation of a MethodInstance`. Reproduces on 1.12.7 and 1.13.0 with nothing but `Base.Compiler.NativeInterpreter`; master has no guard either.
 
 Consider a `Core.CachedGenerator` that runs `typeinf_ext_toplevel` on its callee, over `ping(n) = od(pong, n-1) + 1; pong(n) = od(ping, n-1) + 1`. The chain goes like this:
 
@@ -302,7 +298,7 @@ On 1.13.0:
 
 - With a depth cap of 25, the generator is entered 26 times for `od(ping, 4)`.
 - Uncapped, the recursion runs to about 730 nested generator frames (732 in the recorded run) and prints stack-overflow warnings. Then it either recovers or deadlocks on the JIT lock (`jl_compile_codeinst_now` <- `jl_fptr_wait_for_compiled`). It recovers when `get_staged` swallows the `StackOverflowError`, which happened in 2 of 7 runs, with 737 generator entries and `result = 4`.
-- This script produced no segfault. The segfault first recorded for this bug was actually bug 1, reached because the original reproducer recorded a `CodeInstance` edge. `repro-10.jl` uses `edges = svec(mi)` to stay clear of that crash.
+- The reproducer produced no segfault. The segfault first recorded for this bug was actually bug 1, reached because the original reproducer recorded a `CodeInstance` edge.
 
 This is Differ.jl issue #84. It is also what the feature's first version worked around, for its own generator only, with a task-local `generating_stack`. The same script on that build recursed until its depth cap.
 
@@ -330,7 +326,7 @@ An independent review judged all six fixes ready. The sweep's one real failure, 
 
 **Foreign-owner compile fixes (bugs 5, 6, 8, 9), 2026-09-22.** This tree was built on top of the bug 4 `keep_direct_edge` change, and split into a runtime part (`src/`, now commit (5)) and a driver-and-tests part (now commit (6)). The first version was sent back in review (§5). The revised version was verified in a separate session on seven packages:
 
-- the five reviewer packages in `repro/review-pkgs/`, all with a non-inlineable `target`:
+- five reviewer packages, all with a non-inlineable `target`:
 
   | Package | Foreign instance |
   |---|---|
@@ -340,17 +336,16 @@ An independent review judged all six fixes ready. The sweep's one real failure, 
   | `RefOnly` | `caller` never precompiled |
   | `RefOuter` | `caller` reached only through a precompiled `outer` |
 
-- the two inlineable packages in `repro/pkgs/` (`ForeignInvoke`, `ForeignInvokeEph`).
+- two packages with an inlineable `target`, one on-chain and one ephemeral.
 
-Run them with `JULIA_DEPOT_PATH=<fresh> JULIA_LOAD_PATH="review-pkgs:@stdlib" julia review-pkgs/runpkg.jl BigOwnedABI`, from `repro/`; use `pkgs:@stdlib` for the other two. They include `Compiler/test/newinterp.jl` from the running source build. On pristine master, every package's `caller(2)` returns 31, the native body. With the fix, the non-inlineable packages throw `Failed to invoke or compile external codeinst`, and the inlineable ones return 11. The suites `precompile`, `Compiler/AbstractInterpreter`, `Compiler/inference`, `Compiler/inline`, `staged` and `trim` gave 3277 pass, 16 broken, 0 fail. The clang analysis of `gf.c`, `codegen.cpp` and `builtins.c` is clean. The author's own reproducers, `repro/owner_repro.jl` (cases A-D), `repro/nocodegen.jl` (builtin only) and `repro/sp.jl` (`needsparams`), were used alongside the packages.
+On pristine master, every package's `caller(2)` returns 31, the native body. With the fix, the non-inlineable packages throw `Failed to invoke or compile external codeinst`, and the inlineable ones return 11. The suites `precompile`, `Compiler/AbstractInterpreter`, `Compiler/inference`, `Compiler/inline`, `staged` and `trim` gave 3277 pass, 16 broken, 0 fail. The clang analysis of `gf.c`, `codegen.cpp` and `builtins.c` is clean.
 
-**Reproducers.** Each `repro/repro-NN.jl` is self-contained: an inline interpreter, no includes, no packages. Each carries its captured output in its header, from Julia 1.13.0 (`d1c37793dd2`) and from a local build ("fixes-build", 1.14.0-DEV.3318, master `55312b3c97` plus the uncommitted fixes for bugs 1-4, 7 and 10). For bugs 5, 6, 8 and 9, that build *is* master behaviour. Bug 4's pristine-master result (30) and the bug 10 depth-2 comparison were measured on a pristine-master build.
 
 **Where the fixes belong.** A layering audit of the feature's first version settled two placement questions, and the current commits follow them. The recursion guard belongs in the runtime, around `jl_call_staged` in `jl_code_for_staged`. That function already has the `MethodInstance`, which the generator ABI hides from the generator. A guard there covers every generator kind, including hand-rolled `CachedGenerator`s and the Differ.jl #84 class. The engine cannot take this over: `jl_engine_reserve` keys on `(mi, owner)`, and "being generated" is a different fact from "reserved for inference". The `compile!` fix belonged in both compile drivers and in codegen's shared `tojlinvoke` funnel, not in the feature. Patching one driver left the silent swap reachable through the other driver and through the link-time and JIT fallbacks (bugs 6, 8, 9).
 
 ## Filing upstream
 
-Nothing has been filed. The per-bug sections above are the issue texts. Each section already carries the cause, a minimal reproducer, the observed and expected behaviour, and a proposed fix. Each issue should link its `repro/repro-NN.jl` and quote the relevant part of its header. For bug 6, use `repro/review-pkgs/BigEphNR.jl`; `repro-06.jl` cannot isolate that bug. Use this environment block:
+Nothing has been filed. The per-bug sections above are the issue texts. Each section already carries the cause, a minimal reproducer, the observed and expected behaviour, and a proposed fix. Use this environment block:
 
 ```
 Julia Version 1.13.0, Commit d1c37793dd2 (2026-09-09 19:00 UTC), official release
