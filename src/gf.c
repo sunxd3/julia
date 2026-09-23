@@ -4655,6 +4655,36 @@ JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t
     return ret;
 }
 
+// Whether `owner` is the native compiler (`:trim` is its isolated namespace
+// during `--trim`, re-stamped to `nothing` on serialization; cf. aotcompile.cpp).
+JL_DLLEXPORT int jl_is_native_ci_owner(jl_value_t *owner) JL_NOTSAFEPOINT
+{
+    return owner == jl_nothing || owner == (jl_value_t*)jl_trim_sym;
+}
+
+// Run `codeinst` itself: the tail of `invoke(f, codeinst, args...)` (jl_f_invoke)
+// and the runtime target of a `tojlinvoke` trampoline for a CodeInstance owned by
+// another interpreter that codegen could not link to directly (`emit_tojlinvoke`,
+// `emit_invoke`). Unlike `jl_invoke`, this never dispatches on the MethodInstance
+// for a foreign owner: its CodeInstance can hold a different body than the native
+// cache does for the same MethodInstance, so it is an error if it has no code.
+// No world-range check is done here: a compiled `:invoke` edge to `codeinst` was
+// validated by inference for the caller's world, same as a directly linked one
+// (`jl_f_invoke` checks only because it is a dynamic entry point).
+JL_DLLEXPORT jl_value_t *jl_invoke_codeinst(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_code_instance_t *codeinst)
+{
+    jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
+    if (!invoke) {
+        jl_compile_codeinst(codeinst);
+        invoke = jl_atomic_load_acquire(&codeinst->invoke);
+    }
+    if (invoke)
+        return invoke(F, args, nargs, codeinst);
+    if (!jl_is_native_ci_owner(codeinst->owner))
+        jl_error("Failed to invoke or compile external codeinst");
+    return jl_invoke(F, args, nargs, jl_get_ci_mi(codeinst));
+}
+
 STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_t **sig, size_t n) JL_NOTSAFEPOINT
 {
     // NOTE: This function is a huge performance hot spot!!

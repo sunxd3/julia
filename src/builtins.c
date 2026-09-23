@@ -2113,7 +2113,6 @@ JL_CALLABLE(jl_f_invoke)
     } else if (jl_is_code_instance(argtypes)) {
         jl_code_instance_t *codeinst = (jl_code_instance_t*)args[1];
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-        jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
         // N.B.: specTypes need not be a subtype of the method signature. We need to check both.
         if (jl_is_abioverride(codeinst->def)) {
             jl_datatype_t *abi = (jl_datatype_t*)((jl_abi_override_t*)(codeinst->def))->abi;
@@ -2130,18 +2129,7 @@ JL_CALLABLE(jl_f_invoke)
             jl_current_task->world_age > jl_atomic_load_relaxed(&codeinst->max_world)) {
             jl_error("invoke: CodeInstance not valid for this world");
         }
-        if (!invoke) {
-            jl_compile_codeinst(codeinst);
-            invoke = jl_atomic_load_acquire(&codeinst->invoke);
-        }
-        if (invoke) {
-            return invoke(args[0], &args[2], nargs - 2, codeinst);
-        } else {
-            if (codeinst->owner != jl_nothing) {
-                jl_error("Failed to invoke or compile external codeinst");
-            }
-            return jl_invoke(args[0], &args[2], nargs - 2, mi);
-        }
+        return jl_invoke_codeinst(args[0], &args[2], nargs - 2, codeinst);
     }
     if (!jl_is_tuple_type(jl_unwrap_unionall(argtypes)))
         jl_type_error("invoke", (jl_value_t*)jl_anytuple_type_type, argtypes);

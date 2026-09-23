@@ -44,7 +44,7 @@ oc_static(1), oc_dynamic(1), h(1)              # 2, 2, 101
 
 The dynamic case shows the stored world is applied: dispatch inside the closure body happens in the closure's world and finds the old `h`. No error, because to the runtime nothing is wrong.
 
-## 5. Compiler optimization can be obstructed with OC 
+## 5. Compiler optimization can be obstructed with OC
 
 When creation and call are in the same function, inference tracks the closure as a `PartialOpaque`, infers the body itself, and the optimizer inlines the call and removes the closure: `oc = @opaque (x::Int) -> h(x) * a; oc(b)` compiles to two intrinsics. Nothing was trusted; the compiler re-derived everything in the caller's world.
 
@@ -58,13 +58,13 @@ The packages pay for this in code. Mooncake's `optimise_ir!` (`Mooncake.jl/src/i
 
 ## 6. The proposal
 
-`Core.GeneratedFunctionTransform(transform, gen)` is a second kind of generator for `@generated` methods. `transform` maps the argument types to the call to compile; `gen` returns your `Compiler.AbstractInterpreter` for a given world.
+`Core.GeneratedFunctionTransform(gen)` is a second kind of generator for `@generated` methods. `gen` returns your `Compiler.AbstractInterpreter` for a given world; the call to compile is the generated method's own arguments. The struct, rather than a plain generator function, is what lets the compiler recognise this kind later and infer through it.
 
 ```julia
 @eval function overdub(f, args...)
     $(Expr(:meta, :generated_only))
     $(Expr(:meta, :generated,
-        Core.GeneratedFunctionTransform(identity, world -> MyInterp(; world))))
+        Core.GeneratedFunctionTransform(world -> MyInterp(; world))))
 end
 ```
 
@@ -76,7 +76,7 @@ Nothing happens at definition. On the first call `overdub(g, 2)` with concrete t
 
 The result is inside the method-table bookkeeping, it can be capped, and its range is open-ended. Inference already knows what to do with `invoke` of a named instance (`abstract_invoke`, `Compiler/src/abstractinterpretation.jl:2540-2568`): check the argument types against the instance's signature, check the caller's world is in its range, intersect the ranges, take its return type and effects as facts. The native compiler never sees your IR.
 
-Lazy means: the work happens at the first call, in the caller's world, once per concrete argument tuple. After a redefinition the instance is capped and the next call regenerates. `transform` and `gen` themselves run in the world where the generated method was defined.
+Lazy means: the work happens at the first call, in the caller's world, once per concrete argument tuple. After a redefinition the instance is capped and the next call regenerates. `gen` and your interpreter's own methods (its `method_table` overload, any trait it consults) run in the world where the generated method was defined; only lookups that take the world explicitly, overlay tables and the inner inference, see the caller's world. A result inferred under that frozen view is cached under your owner and reused by later users, so a tool whose interpreter can change within a session should put a version in `cache_owner`.
 
 | | opaque closure | transform |
 |---|---|---|
@@ -86,7 +86,7 @@ Lazy means: the work happens at the first call, in the caller's world, once per 
 | world range | one past world | open range, capped by edges |
 | caching | per creation | per specialization, shared by all callers |
 | calls between transformed bodies | a boundary each | one inference |
-| package image | segfault on load (julia#55073) | works; `--trim` works |
+| package image | segfault on load (julia#55073) | works |
 
 ## 7. What it allows and what it costs
 
@@ -94,19 +94,19 @@ A call compiled by another compiler that is still an ordinary call: it dispatche
 
 The body of the generated method has only its arguments, so state a closure would have captured must be passed in. For these packages that is mechanical: Mooncake's captures are already a tuple of stacks, Libtask's a tuple of `Ref`s. Ordinary Julia closures work the same way: a struct holding the captured values and a method reading them from its first argument.
 
-A generator runs only for concrete argument types, so a caller that does not know the types infers `Any`. The transformed IR is never inlined into native code, because it was derived under a different method table or lattice.
+A generator runs only for concrete argument types, so a caller that does not know the types infers `Any`. The transformed IR is never inlined into native code, because it was derived under a different method table or lattice. Keyword arguments are not supported, an interpreter without a `codegen_cache` fails under `--compile=min`, and `cache_owner` must not be `nothing`.
 
 ## 8. Soundness
 
-Julia main seems to have some unsound logic, the code changes on this branch fix them.
+Getting here needed six fixes to Julia, each a separate commit before the feature: the C backedge decoder in `jl_code_for_staged` (segfaults on 1.12 and 1.13), the inliner's owner swap, `abstract_invoke` inferring a foreign `invoke` nothrow, a runtime bound on re-entrant generation, codegen's trampoline, and the compile drivers. Two more, copying a generator's `CodeInfo` and checking its world range, are upstream-only.
 
 The inliner's `compileable_specialization` replaced a given `CodeInstance` with whatever the current compiler's cache held for the same `MethodInstance`. With two owners on one chain that substituted Julia's code for the tool's, silently. It now keeps the given instance when the owner differs.
 
-The package-image compilation driver looked an `invoke` target up only in Julia's own codegen cache, never found a foreign instance, re-inferred natively and emitted that. A caller loaded from an image returned the native answer. It now emits the foreign instance from the IR it carries.
+Both compile drivers, the JIT's and the package image's, re-inferred a foreign `invoke` target natively when they found no source, and codegen's trampoline dispatched it by `MethodInstance`. A caller loaded from an image returned the native answer. The drivers now emit the foreign instance from the IR it carries or skip it, and the trampoline runs the instance itself or raises the same error as `invoke`; only `--trim` fails the build.
 
-A transformed body may call the generated method for a callee whose transformed body reaches the first. Each level started a fresh top-level inference, so cycle detection, which works within one inference, never saw it, and the generator recursed until the stack overflowed (880 generator runs). The generator now keeps a per-task record of the specializations it is generating and refuses a repeated request; that call site is compiled as an `invoke` of the method instance with an unknown result, and at run time finds the body finished by the outer level. A callee calling itself inside a transformed body is an ordinary inference cycle.
+A transformed body may call the generated method for a callee whose transformed body reaches the first. Each level started a fresh top-level inference, so cycle detection, which works within one inference, never saw it, and the generator recursed until the stack overflowed (880 generator runs). The runtime now keeps a per-thread stack of the method instances being generated and refuses the second re-entry of one; that call site is compiled as an `invoke` of the method instance with an unknown result, and at run time finds the body finished by the outer level. Ping/pong now runs the generator 4 times. A callee calling itself inside a transformed body is an ordinary inference cycle.
 
-The remaining rules: the instance is an edge of the body, so whatever caps it caps every caller. `transform` and `gen` are fixed by the definition; only the lookup and inner inference use the caller's world. The instance's return type and effects are believed, so anything the tool reads without recording an edge is invisible to invalidation. Methods added to an overlay table after a body was generated do not invalidate it (method-table backedges exist only for the global table); replacing an existing overlay method does.
+The remaining rules: the instance is an edge of the body, so whatever caps it caps every caller. `gen` and the interpreter's own methods are fixed by the definition, and a result derived under them is reused by the owner; only the lookup and inner inference use the caller's world. The instance's return type and effects are believed, so anything the tool reads without recording an edge is invisible to invalidation. Methods added to an overlay table after a body was generated do not invalidate it (method-table backedges exist only for the global table); replacing an existing overlay method does.
 
 ## 9. Worked example: from `IRCode` to a function
 

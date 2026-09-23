@@ -325,19 +325,46 @@ function invoke_default_compiler(fname::Symbol, args...)
     end
 end
 
+# The `Compiler` module an interpreter belongs to, found through its `AbstractInterpreter`
+# supertype (a `Compiler` loaded separately from the one in the system image has its own),
+# or `nothing` if `interp` is not an `AbstractInterpreter`.
+function interp_compiler(@nospecialize interp)
+    T = typeof(interp)
+    while T !== Any
+        tn = typename(T)
+        if tn.name === :AbstractInterpreter
+            if isdefined(tn.module, :AbstractInterpreter) &&
+               getglobal(tn.module, :AbstractInterpreter) === tn.wrapper
+                return tn.module
+            end
+            return nothing
+        end
+        T = supertype(T)
+    end
+    return nothing
+end
+
 function invoke_interp_compiler(interp, fname::Symbol, args...)
     if interp === nothing
         return invoke_default_compiler(fname, args...)
     else
-        T = typeof(interp)
-        while true
-            Tname = typename(T).name
-            Tname === :Any && error("Expected AbstractInterpreter")
-            Tname === :AbstractInterpreter && break
-            T = supertype(T)
-        end
-        return getglobal(typename(T).module, fname)(args...)
+        C = interp_compiler(interp)
+        C === nothing && error("Expected AbstractInterpreter")
+        return getglobal(C, fname)(args...)
     end
+end
+
+# The generator of a method whose body is produced by `Core.GeneratedFunctionTransform`.
+# It lives here rather than in `Compiler` so that the `Compiler` the interpreter belongs
+# to does the work, whether it is the one in the system image or one loaded separately.
+function (g::Core.GeneratedFunctionTransform)(world::UInt, source::Method, @nospecialize args...)
+    interp = g.gen(world)
+    C = interp_compiler(interp)
+    C === nothing && throw(ArgumentError(
+        "GeneratedFunctionTransform: `gen` must return a `Compiler.AbstractInterpreter`, got $(typeof(interp))"))
+    isdefined(C, :generate_transformed_body) || throw(ArgumentError(
+        "GeneratedFunctionTransform: `gen` returned a $(typeof(interp)), whose `AbstractInterpreter` comes from $C, which has no `generate_transformed_body`; `gen` must return an interpreter from a `Compiler` module that provides it"))
+    return getglobal(C, :generate_transformed_body)(g, interp, world, source, args)
 end
 
 function invoke_mt_compiler(mt, fname::Symbol, args...)

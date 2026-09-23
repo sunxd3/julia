@@ -768,6 +768,21 @@ JL_DLLEXPORT jl_code_instance_t *jl_cache_uninferred(jl_method_instance_t *mi JL
     return newci;
 }
 
+// A generator may run inference, and that inference may ask for the body of a generated
+// method whose generator is already running on this thread: a body that calls the
+// generated method for another callee, whose body calls the first. When inference is
+// entered through `jl_type_infer` (e.g. `precompile` from a generator) the engine refuses
+// to recur on a MethodInstance this thread has reserved, so the generator is re-entered
+// at most once. A generator that calls the compiler directly bypasses that check, and
+// every request starts a fresh generation until the stack overflows. Allow the one
+// re-entry that is bounded anyway and refuse the next. Task switches are not allowed
+// inside a generator, so a per-thread stack of the MethodInstances being generated is exact.
+struct staged_in_progress_t {
+    jl_method_instance_t *mi;
+    struct staged_in_progress_t *prev;
+};
+static __thread struct staged_in_progress_t *staged_in_progress = NULL;
+
 // Return a newly allocated CodeInfo for the function signature
 // effectively described by the tuple (specTypes, env, Method) inside linfo
 JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, jl_code_instance_t **cache JL_OUT_ROOTED_BY_ARG(0))
@@ -784,9 +799,19 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
         return (jl_code_info_t*)jl_copy_ast((jl_value_t*)src);
     }
 
+    jl_method_t *def = mi->def.method;
+    int nested = 0;
+    for (struct staged_in_progress_t *f = staged_in_progress; f != NULL; f = f->prev) {
+        if (f->mi == mi && ++nested == 2)
+            jl_errorf("Generated function %s is already being generated for this signature; "
+                      "its generator or the code it inferred keeps calling back into it",
+                      jl_symbol_name(def->name));
+    }
+    struct staged_in_progress_t in_progress = { mi, staged_in_progress };
+    staged_in_progress = &in_progress;
+
     JL_TIMING(STAGED_FUNCTION, STAGED_FUNCTION);
     jl_value_t *tt = mi->specTypes;
-    jl_method_t *def = mi->def.method;
     jl_timing_show_method_instance(mi, JL_TIMING_DEFAULT_BLOCK);
     jl_value_t *generator = def->generator;
     assert(generator != NULL);
@@ -917,10 +942,12 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
         ct->ptls->in_pure_callback = last_in;
         jl_atomic_store_relaxed(&jl_lineno, last_lineno);
         ct->world_age = last_age;
+        staged_in_progress = in_progress.prev;
     }
     JL_CATCH {
         ct->ptls->in_pure_callback = last_in;
         jl_atomic_store_relaxed(&jl_lineno, last_lineno);
+        staged_in_progress = in_progress.prev;
         jl_rethrow();
     }
     JL_GC_POP();

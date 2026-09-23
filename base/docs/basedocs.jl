@@ -4258,41 +4258,49 @@ The current differences are:
 Core.finalizer
 
 """
-    Core.GeneratedFunctionTransform(transform, gen)
+    Core.GeneratedFunctionTransform(gen)
 
 A generator for a [`@generated`](@ref) method whose body is produced by a custom
 `Compiler.AbstractInterpreter` instead of by user code returning an expression.
-When a specialization of the generated method is needed, the runtime
+The generated method takes the function to call as its first argument, followed by the
+arguments to call it with (e.g. `overdub(f, args...)`). When a specialization of it is
+needed for a requesting `world`, the runtime
 
-1. collects the argument types of the call, excluding the generated function itself,
-   as a tuple type `argtypes` and computes `lookup = transform(argtypes)`, the signature
-   of the call to transform; `transform` must preserve the number and order of the
-   arguments, since the generated method's own arguments are forwarded to it positionally;
-2. constructs `interp = gen(world)::Compiler.AbstractInterpreter` for the requesting
-   `world`, and runs inference and optimization of the method matching `lookup` with it;
-3. returns a body that `invoke`s the resulting `CodeInstance`, recording that instance
-   as an edge so that the body is regenerated whenever the inner result is invalidated.
+1. constructs `interp = gen(world)`, which must be a `Compiler.AbstractInterpreter`
+   that infers in `world` (`Compiler.get_inference_world(interp) == world`) and has a
+   `Compiler.cache_owner` other than `nothing`; otherwise an `ArgumentError` is thrown;
+2. looks up the call itself, i.e. the argument types of the specialization without the
+   generated function, in the method table of `interp`, and infers and optimizes it with
+   `interp`, producing a `CodeInstance` `ci` owned by `interp`;
+3. uses `invoke(f, ci, args...)` as the body, recording `ci` as an edge.
 
-Like the body of any generated function, `transform` and `gen` run in the world in which
-the generated method was defined and must be pure functions of their arguments: what
-they call is not tracked, and redefining them later only affects generated methods
-defined afterwards. Only the inference they set up happens in the requesting `world`.
-`gen` must return an interpreter whose `Compiler.get_inference_world` is `world` and
-whose `Compiler.cache_owner` is not `nothing`.
+The result is therefore cached per specialization like any generated body, and it is
+regenerated when invalidation of `ci` invalidates it. Native callers see the return type
+and effects of `ci` and `:invoke` it directly.
 
 A transformed body may call the generated method again, for a callee whose transformed
-body in turn reaches the first (any recursive callee does this). A request for a
-specialization whose body is already being generated fails rather than recursing; that one
-call is then compiled without knowledge of its result, and at run time it finds the finished
-body. Recursion
-inside a transformed body, a callee calling itself, is an ordinary inference cycle and needs
-no such handling.
+body in turn reaches the first (any recursive callee does this). The runtime bounds such
+re-entrant generation: a specialization may be re-entered once while it is being
+generated, and a second re-entry is refused; that call is then compiled without knowledge
+of its result and resolved dynamically at run time. Recursion inside a transformed body, a
+callee calling itself, is an ordinary inference cycle and needs no such handling.
 
-!!! note
-    Methods added to an overlay method table after a body was generated do not
-    invalidate it, because the runtime only keeps method-table backedges for the global
-    method table. This is a general limitation of `Compiler.OverlayMethodTable`, and
-    applies equally to the code inferred by the inner interpreter.
+Like the body of any generated function, the generator runs in the world in which the
+generated method was defined. Thus `gen` and the methods of the interpreter type (its
+`Compiler.method_table`, its parameters and other traits) are those visible at that
+point, and redefining them later only affects generated methods defined afterwards.
+Lookups made with an explicit world, such as those in the interpreter's method table and
+the whole inner inference, do see the requesting `world`. Since a body cached under a
+given `cache_owner` is reused as is, tools should version their `cache_owner` when their
+transformation changes.
+
+Limitations:
+- With `--compile=min`, the interpreter must provide a `Compiler.codegen_cache`, since
+  the inner `CodeInstance` is not otherwise compiled.
+- Methods with keyword arguments are not supported.
+- Methods added to an overlay method table after a body was generated do not invalidate
+  it, because the runtime only keeps method-table backedges for the global method table.
+  This is a general limitation of `Compiler.OverlayMethodTable`.
 
 ```julia
 Base.Experimental.@MethodTable MT
@@ -4301,7 +4309,7 @@ Base.Experimental.@overlay MT Base.sin(x::Float64) = 42.0
 struct MyInterp <: Compiler.AbstractInterpreter ... end  # uses `MT` as its method table
 @eval function overdub(f, args...)
     \$(Expr(:meta, :generated_only))
-    \$(Expr(:meta, :generated, Core.GeneratedFunctionTransform(identity, world -> MyInterp(; world))))
+    \$(Expr(:meta, :generated, Core.GeneratedFunctionTransform(world -> MyInterp(; world))))
 end
 overdub(sin, 1.0) # 42.0
 ```

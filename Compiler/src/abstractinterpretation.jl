@@ -2547,8 +2547,10 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
                 end
                 return Future(CallMeta(Bottom, ErrorException, EFFECTS_THROWS, NoCallInfo()))
             end
+            # `invoke` compiles a `CodeInstance` that has no code yet; for a foreign-owned
+            # one it refuses to fall back to the native method and throws instead.
             # TODO: When we add curing, we may want to assume this is nothrow
-            if (method_or_ci.owner === Nothing && method_or_ci.def.def isa Method)
+            if method_or_ci.owner !== nothing
                 exct_ci = Union{exct_ci, ErrorException}
             end
             update_valid_age!(sv, our_world, callee_valid_range)

@@ -1014,12 +1014,11 @@ end
 abstract type CachedGenerator end
 
 # A generator whose body is produced by running a caller-supplied
-# `Compiler.AbstractInterpreter` on the call selected by the argument types,
-# rather than by user code returning an AST. See `Core.GeneratedFunctionTransform`.
+# `Compiler.AbstractInterpreter` on the call itself, rather than by user code
+# returning an AST. See `Core.GeneratedFunctionTransform`.
 struct GeneratedFunctionTransform
-    transform # (argtypes::Type{<:Tuple},) -> Type{<:Tuple}
-    gen       # (world::UInt,) -> Compiler.AbstractInterpreter
-    GeneratedFunctionTransform(@nospecialize(transform), @nospecialize(gen)) = new(transform, gen)
+    gen # (world::UInt) -> Compiler.AbstractInterpreter
+    GeneratedFunctionTransform(@nospecialize(gen)) = new(gen)
 end
 
 NamedTuple() = NamedTuple{(),Tuple{}}(())

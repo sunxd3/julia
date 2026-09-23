@@ -1926,11 +1926,12 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
                      ci_has_invoke(edge) || ci_has_source(workqueue.interp, edge) ||
                      !iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), get_ci_mi(edge), edge)))
                 # The globally-cached check keeps batches closed under invoke
-                # edges even when the edge's source lives only in another
-                # interpreter's codegen cache (activation clears `inferred`,
-                # so `ci_has_source` cannot see it): the drain loops re-infer
-                # such edges, preventing them from silently leaking to
-                # permanent `tojlinvoke` fallbacks at link time. Uncached
+                # edges whose CodeInstance is published on the `mi.cache`
+                # chain but whose source is not visible from here (typically
+                # one owned by another interpreter that discarded its IR
+                # after compiling it): the drain loops re-infer such an edge
+                # if they own it, and otherwise handle it as described at
+                # `is_foreign_owned`. Uncached
                 # speculative edges must NOT be enqueued unconditionally:
                 # resolved invoke edges of recursion that inference widened
                 # (e.g. self-recursion with a growing tuple argument) form an
@@ -2018,6 +2019,31 @@ jit_cache_root!(::InternalCodeCache, ::CodeInstance) = nothing
 jit_cache_root!(cache::OverlayCodeCache, ci::CodeInstance) =
     jit_cache_root!(cache.globalcache, ci)
 
+# Whether `ci` belongs to a different compiler than `interp`. The drain loops below
+# (`add_codeinsts_to_jit!`, `compile!`) treat such a CodeInstance differently from
+# one of their own:
+#  - It is emitted from the source it carries (`ci_get_source`; the serializer keeps
+#    `inferred` for foreign owners) and never re-inferred under our owner in its
+#    place. The caller's `:invoke` names `ci` itself, and a re-inferred substitute
+#    would leave that edge unresolved, to be linked to a `tojlinvoke` fallback that
+#    then runs whatever body the native cache holds for the MethodInstance (the two
+#    can differ, e.g. through an overlay method table).
+#  - Without source it is skipped. Its `:invoke` edge then links to a trampoline that
+#    hands the CodeInstance itself to the runtime (`jl_invoke_codeinst`), which runs
+#    code its owner attaches later or errors, exactly like `invoke(f, ci, args...)`.
+#    Under `--trim` there is no runtime fallback, so that is a hard failure instead.
+#  - It is never inserted into `code_cache(interp)` (`setindex!` checks the owner);
+#    it stays wherever its owner keeps it.
+# The `:trim` owner is the native compiler's isolated namespace during `--trim`
+# (re-stamped to `nothing` on serialization; cf. aotcompile.cpp), so the two are one
+# owner.
+is_native_owner(@nospecialize(owner)) = owner === nothing || owner === :trim
+function is_foreign_owned(interp::AbstractInterpreter, ci::CodeInstance)
+    owner = cache_owner(interp)
+    ci.owner === owner && return false
+    return !(is_native_owner(ci.owner) && is_native_owner(owner))
+end
+
 function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UInt8)
     source_mode == SOURCE_MODE_ABI || return ci
     ci isa CodeInstance && !ci_has_invoke(ci) || return ci
@@ -2043,6 +2069,14 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
         end
         src = ci_get_source(interp, callee)
         if !isa(src, CodeInfo)
+            if is_foreign_owned(interp, callee)
+                # foreign and without source: leave the edge to the runtime (see
+                # `is_foreign_owned`). The caller's code only refers to `callee` as
+                # a literal, which its owner's cache (or the caller's `edges`) keeps
+                # alive; no code is emitted for it here, so nothing to root.
+                markinspected!(workqueue, callee)
+                continue
+            end
             newcallee = typeinf_ext(workqueue.interp, callee.def, source_mode) # always SOURCE_MODE_ABI
             if newcallee isa CodeInstance
                 callee === ci && (ci = newcallee) # ci stopped meeting the requirements after typeinf_ext last checked, try again with newcallee
@@ -2058,21 +2092,28 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
         sptypes = sptypes_from_meth_instance(mi)
         collectinvokes!(workqueue, src, sptypes)
         if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
-            valid_worlds = WorldRange(get_inference_world(workqueue.interp))
-            cached = find_equivalent_cached_ci(
-                workqueue.interp, callee, valid_worlds)
-            if cached === nothing
-                # make sure callee is cached, as required by jl_add_codeinsts_to_jit
-                code_cache(workqueue.interp)[mi] = callee
+            if is_foreign_owned(workqueue.interp, callee)
+                # A foreign CodeInstance that its owner keeps off the `mi.cache`
+                # chain (e.g. in an ephemeral cache). We cannot reach the cache
+                # that holds it, so use the conservative generic root.
+                jit_cache_root!(nothing, callee)
             else
-                # use an existing CI from the cache, if there is available one that is compatible
-                callee === ci && (ci = cached)
-                callee = cached
+                valid_worlds = WorldRange(get_inference_world(workqueue.interp))
+                cached = find_equivalent_cached_ci(
+                    workqueue.interp, callee, valid_worlds)
+                if cached === nothing
+                    # make sure callee is cached, as required by jl_add_codeinsts_to_jit
+                    code_cache(workqueue.interp)[mi] = callee
+                else
+                    # use an existing CI from the cache, if there is available one that is compatible
+                    callee === ci && (ci = cached)
+                    callee = cached
+                end
+                # `callee` is about to be emitted while absent from the native
+                # `mi.cache` chain; the executable cache it lives in must root it
+                # for the lifetime of the process (see `jit_cache_root!`).
+                jit_cache_root!(code_cache(workqueue.interp), callee)
             end
-            # `callee` is about to be emitted while absent from the native
-            # `mi.cache` chain; the executable cache it lives in must root it
-            # for the lifetime of the process (see `jit_cache_root!`).
-            jit_cache_root!(code_cache(workqueue.interp), callee)
         end
         push!(codeinsts, callee)
         push!(srcs, src)
@@ -2099,6 +2140,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
     invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
     enqueue_unprepared_invokes::Bool = false,
     external_linkage::Bool,
+    trim_mode::UInt8 = TRIM_NO,
 )
     interp = workqueue.interp
     world = get_inference_world(interp)
@@ -2140,15 +2182,27 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             # now make sure everything has source code, if desired
             if use_const_api(callee)
                 src = codeinfo_for_const(interp, mi, WorldRange(callee.min_world, callee.max_world), callee.edges, callee.rettype_const)
+            elseif is_foreign_owned(interp, callee)
+                # emit a foreign CodeInstance from its own source, or skip it (see
+                # `is_foreign_owned`)
+                src = ci_get_source(interp, callee)
+                if !isa(src, CodeInfo)
+                    markinspected!(workqueue, callee)
+                    # no runtime fallback in a trimmed image: report like the trim
+                    # verifier does, i.e. fail under `TRIM_SAFE`, warn under
+                    # `TRIM_UNSAFE_WARN` and skip silently under `TRIM_UNSAFE` (this runs
+                    # in the frozen typeinf world, so only `Core` printing is available)
+                    if trim_mode == TRIM_SAFE || trim_mode == TRIM_UNSAFE_WARN
+                        Core.println(Core.stderr, trim_mode == TRIM_SAFE ? "Error" : "Warning",
+                                     ": cannot compile CodeInstance for ", mi,
+                                     " owned by ", callee.owner,
+                                     ": its source is not available and it cannot be re-inferred in its place")
+                        trim_mode == TRIM_SAFE && throw(Core.TrimFailure())
+                    end
+                    continue
+                end
             else
                 src = get(interp.codegen, callee, nothing)
-                if src === nothing && callee.owner !== cache_owner(interp)
-                    # A CodeInstance owned by another interpreter (e.g. the target of an
-                    # `invoke(f, ci, args...)`) is not interchangeable with what we would
-                    # infer for its MethodInstance ourselves, so it must be emitted from
-                    # the optimized IR it retains rather than re-inferred under our owner.
-                    src = ci_get_source(interp, callee)
-                end
                 if src === nothing
                     newcallee = typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)
                     if newcallee isa CodeInstance
@@ -2167,7 +2221,9 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                 collectinvokes!(workqueue, src, sptypes; invokelatest_queue,
                                 enqueue_unprepared_invokes, external_linkage)
                 # try to reuse an existing CodeInstance from before to avoid making duplicates in the cache
-                if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
+                # (a foreign CodeInstance stays wherever its owner keeps it)
+                if !is_foreign_owned(interp, callee) &&
+                        iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
                     cached = find_equivalent_cached_ci(
                         interp, callee, WorldRange(world))
                     if cached === nothing
@@ -2212,14 +2268,14 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
 
         append!(workqueue, methods)
         compile!(codeinfos, workqueue; invokelatest_queue, external_linkage,
-                 enqueue_unprepared_invokes = trim_mode != TRIM_NO)
+                 enqueue_unprepared_invokes = trim_mode != TRIM_NO, trim_mode)
     end
 
     if invokelatest_queue !== nothing
         # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
         # (it will enqueue into itself and immediately drain)
         compile!(codeinfos, invokelatest_queue; invokelatest_queue, external_linkage,
-                 enqueue_unprepared_invokes = trim_mode != TRIM_NO)
+                 enqueue_unprepared_invokes = trim_mode != TRIM_NO, trim_mode)
     end
 
     if trim_mode != TRIM_NO && trim_mode != TRIM_UNSAFE

@@ -1009,6 +1009,11 @@ static const auto jlinvokeoc_func = new JuliaFunction<>{
     get_func2_sig,
     get_func_attrs,
 };
+static const auto jlinvokecodeinst_func = new JuliaFunction<>{
+    XSTR(jl_invoke_codeinst),
+    get_func2_sig,
+    get_func_attrs,
+};
 static const auto jlopaque_closure_call_func = new JuliaFunction<>{
     XSTR(jl_f_opaque_closure_call),
     get_func_sig,
@@ -6323,7 +6328,11 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                     bool specsig, needsparams;
                     std::tie(specsig, needsparams) = uses_specsig(get_ci_abi(codeinst), mi, codeinst->rettype, ctx.params->prefer_specsig);
                     if (needsparams) {
-                        Value *r = emit_jlcall(ctx, jlinvoke_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
+                        Value *r;
+                        if (jl_is_native_ci_owner(codeinst->owner))
+                            r = emit_jlcall(ctx, jlinvoke_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
+                        else // a foreign CodeInstance must be run itself, never dispatched by MethodInstance (see emit_tojlinvoke)
+                            r = emit_jlcall(ctx, jlinvokecodeinst_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)codeinst)), argv, nargs, julia_call2);
                         result = mark_julia_type(ctx, r, true, rt);
                     }
                     else {
@@ -7945,6 +7954,15 @@ static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Value *theFunc, j
     Value *theFarg;
 
     if (theFunc) {
+        theFarg = literal_pointer_val(ctx, (jl_value_t*)codeinst);
+    }
+    else if (!jl_is_native_ci_owner(codeinst->owner)) {
+        // A CodeInstance owned by another interpreter may hold a different body
+        // than the native cache does for its MethodInstance, so dispatching on
+        // the MethodInstance (below) would run the wrong code. Hand the
+        // CodeInstance itself to the runtime, which runs it if its owner gave
+        // it code and errors otherwise (cf. `jl_f_invoke`).
+        theFunc = prepare_call(jlinvokecodeinst_func);
         theFarg = literal_pointer_val(ctx, (jl_value_t*)codeinst);
     }
     else {
@@ -11276,6 +11294,7 @@ static void init_jit_functions(void)
         add_named_global(jl_builtin_f_names[i], jl_builtin_f_addrs[i]);
     add_named_global(jlapplygeneric_func, &jl_apply_generic);
     add_named_global(jlinvoke_func, &jl_invoke);
+    add_named_global(jlinvokecodeinst_func, &jl_invoke_codeinst);
     add_named_global(jltopeval_func, &jl_toplevel_eval);
     add_named_global(jlcopyast_func, &jl_copy_ast);
     //add_named_global(jlnsvec_func, &jl_svec);

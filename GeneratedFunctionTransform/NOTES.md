@@ -1,5 +1,7 @@
 # Background notes: `Core.GeneratedFunctionTransform`
 
+Historical notes from 2026-09-15; line anchors are against a5469f542f and the design has since changed (see RFC.md).
+
 ## The machinery the feature touches
 
 **The four objects.** Method (`src/julia.h:413`) -> MethodInstance (`:491`) -> CodeInstance (`:540`), CodeInfo (`:363`). `owner` is on CodeInstance, not MethodInstance, so two interpreters share one MethodInstance and hang separate instances on its `next` chain.
@@ -12,7 +14,7 @@
 
 **tfuncs.** Type transfer functions for builtins/intrinsics; table at `Compiler/src/tfuncs.jl:55` and `:57`, registered by `add_tfunc`, dispatched from `builtin_tfunction` (`:3115`) via `abstract_call_builtin` (`abstractinterpretation.jl:2242`).
 
-**The diff itself.** Generator at `Compiler/src/generators.jl:69`; recursion guard `:84`; edges + world range `:115`. `abstract_invoke` CI branch `abstractinterpretation.jl:2549` (trusts rettype/exct/effects, narrows world, negative narrowing when out of range). Ownership fix `inlining.jl:781`. C decoder `src/method.c:875`. Two worlds: generator runs pinned to `primary_world` (`src/method.c:807`), lookup + inner inference use requesting `world`.
+**The diff itself.** Generator at `Compiler/src/generators.jl:69`; recursion guard `:84` (superseded: removed, see below); edges + world range `:115`. `abstract_invoke` CI branch `abstractinterpretation.jl:2549` (trusts rettype/exct/effects, narrows world, negative narrowing when out of range). Ownership fix `inlining.jl:781`. C decoder `src/method.c:875`. Two worlds: generator runs pinned to `primary_world` (`src/method.c:807`), lookup + inner inference use requesting `world`.
 
 ## Conclusions reached
 
@@ -40,7 +42,7 @@ Contrast with OC: instances in pkgimages segfault by design (julia#55073, #62180
 
 Reproduction: `ping(n) = overdub(pong, n-1)+1; pong(n) = overdub(ping, n-1)+1; overdub(ping, 4)`. Inference of `overdub(ping,::Int)` runs the generator -> fresh interp -> `typeinf_ext_toplevel(ping(::Int))` -> needs the body of `overdub(pong,::Int)` -> generator -> fresh interp -> `pong(::Int)` -> needs `overdub(ping,::Int)` whose body does not exist yet (first generator has not returned) -> generator again -> ... Observed: 880 generator runs, two "detected a stack overflow; program state may be corrupted" warnings, then `get_staged` swallows the error, the call infers `Any`, runtime dispatch regenerates at top level and the answer (4) is right. Plain recursion inside a transformed body (`fact`) is fine: 1 generator run, ordinary inference cycle in the tool's domain. Why not caught: inference cycle detection walks `sv.parent` within one inference; each nested `typeinf_ext_toplevel` is a new root with a new interpreter. `jl_engine_reserve` (`src/engine.c:84-130`) detects a thread waiting on itself but on same-thread re-entry just proceeds with a new placeholder (`cond` path). This is Differ's issue #84 / its `dualized_impl_in_progress` guard, in our setting.
 
-Fix: a per-task stack of `(source, fullsig)` in progress in `generate_transformed_body` (`generating_stack` in `generators.jl`); on re-entry throw (matches RFC §4.4 semantics). Verified after the fix: the refused call site is compiled as `Expr(:invoke, MethodInstance for overdub(::typeof(ping), ::Int64), ...)` (dispatch resolved statically, no CI, result `Any`); at run time it finds the body cached by the outer level. ping/pong: 2 generator runs, no stack overflow. Cost per cycle edge: one code lookup plus an untyped result. For the AD use case (rules calling `overdub` on every callee) recursive primals make this the common case, so this matters. Tests `gft_overdub5` ping/pong, self, fact in `Compiler/test/AbstractInterpreter.jl`; RFC §4.2 covers it; docstring paragraph added.
+*Superseded:* the Julia-side guard described in this paragraph was removed; re-entry is now bounded by the runtime in `jl_code_for_staged` ("method: Bound re-entrant generation of a MethodInstance", RFC §4.2), with different generator counts. Original fix: a per-task stack of `(source, fullsig)` in progress in `generate_transformed_body` (`generating_stack` in `generators.jl`); on re-entry throw (matches RFC §4.4 semantics). Verified after the fix: the refused call site is compiled as `Expr(:invoke, MethodInstance for overdub(::typeof(ping), ::Int64), ...)` (dispatch resolved statically, no CI, result `Any`); at run time it finds the body cached by the outer level. ping/pong: 2 generator runs, no stack overflow. Cost per cycle edge: one code lookup plus an untyped result. For the AD use case (rules calling `overdub` on every callee) recursive primals make this the common case, so this matters. Tests `gft_overdub5` ping/pong, self, fact in `Compiler/test/AbstractInterpreter.jl`; RFC §4.2 covers it; docstring paragraph added.
 
 ## `--trim` (tested by hand 2026-09-15, works)
 
