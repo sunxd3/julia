@@ -29,7 +29,8 @@ static htable_t *reservation_map_for_owner(jl_value_t *owner) JL_NOTSAFEPOINT
 {
     if (owner == jl_nothing)
         return &native_reservations;
-    htable_t **reservations = (htable_t **)ptrhash_bp(&foreign_reservations, owner);
+    // owners are compared by egal, as the caches compare them
+    htable_t **reservations = (htable_t **)ptrhash_bp(&foreign_reservations, (void*)jl_object_id(owner));
     if (*reservations == HT_NOTFOUND)
         *reservations = htable_new((htable_t*)malloc_s(sizeof(htable_t)), 1);
     return *reservations;

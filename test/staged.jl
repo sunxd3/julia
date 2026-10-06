@@ -523,6 +523,34 @@ mixed_callee(x::Int) = x + 2
 @test doit_mixed(1) == 3
 @test mixed_edges_runs[] == 3
 
+# A generator that infers code may reach a generated method whose generator is already
+# running (mutual recursion through the generated method). Inference does not recur on a
+# `MethodInstance` the thread is already inferring, so the request that would close the
+# cycle gets no body and that call is resolved at run time, instead of generating without
+# bound.
+struct GeneratorRecursive <: Core.CachedGenerator end
+const recursive_gen_runs = Ref(0)
+function (::GeneratorRecursive)(world::UInt, source::Method, self, f, arg)
+    recursive_gen_runs[] += 1
+    recursive_gen_runs[] > 20 && error("unbounded generator recursion")
+    mi = Base.specialize_method(Base._which(Tuple{f, arg}; world))
+    interp = Base.Compiler.NativeInterpreter(world)
+    ci = Base.Compiler.typeinf_ext_toplevel(interp, mi, Base.Compiler.SOURCE_MODE_ABI)
+    src = generate_lambda_ex(world, source, (:doit_recursive, :func, :arg), (), :(func(arg)))
+    src.edges = Core.svec(ci)
+    src.min_world = ci.min_world
+    src.max_world = ci.max_world
+    return src
+end
+@eval function doit_recursive(func, arg)
+    $(Expr(:meta, :generated, GeneratorRecursive()))
+    $(Expr(:meta, :generated_only))
+end
+recursive_ping(n::Int) = n <= 0 ? 0 : doit_recursive(recursive_pong, n - 1) + 1
+recursive_pong(n::Int) = n <= 0 ? 0 : doit_recursive(recursive_ping, n - 1) + 1
+@test doit_recursive(recursive_ping, 4) == 4
+@test recursive_gen_runs[] == 3 # ping, pong, and the refused request for ping again
+
 # Test that writing a bad cassette-style pass gives the expected error (#49715)
 function generator49715(world, source, self, f, tt)
     tt = Base.type_parameter(tt)
