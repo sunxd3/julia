@@ -572,6 +572,9 @@ end
 
 engine_reserve(interp::AbstractInterpreter, mi::MethodInstance) = engine_reserve(mi, cache_owner(interp))
 engine_reserve(mi::MethodInstance, @nospecialize owner) = ccall(:jl_engine_reserve, Any, (Any, Any), mi, owner)::CodeInstance
+# whether this thread is already inferring `mi` for `interp`'s cache
+engine_hasreserved(interp::AbstractInterpreter, mi::MethodInstance) =
+    ccall(:jl_engine_hasreserved, Cint, (Any, Any), mi, cache_owner(interp)) != 0
 # engine_fulfill(::AbstractInterpreter, ci::CodeInstance, src::CodeInfo) = ccall(:jl_engine_fulfill, Cvoid, (Any, Any), ci, src) # currently the same as engine_reject, so just use that one
 engine_reject(::AbstractInterpreter, ci::CodeInstance) = ccall(:jl_engine_fulfill, Cvoid, (Any, Ptr{Cvoid}), ci, C_NULL)
 

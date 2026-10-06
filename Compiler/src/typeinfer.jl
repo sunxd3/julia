@@ -1851,6 +1851,12 @@ function typeinf_ext(interp::AbstractInterpreter, mi::MethodInstance, source_mod
         end
     end
     def = mi.def
+    # as in `jl_type_infer`, do not recur on a MethodInstance this thread is already
+    # inferring (a generator that runs inference can request its own body again)
+    if engine_hasreserved(interp, mi)
+        ccall(:jl_typeinf_timing_end, Cvoid, (UInt64, Cint), start_time, 0)
+        return nothing
+    end
     ci = engine_reserve(interp, mi)
     # check cache again if it is still new after reserving in the engine
     let code = find_typeinf_cached_ci(interp, mi, valid_worlds, source_mode)
