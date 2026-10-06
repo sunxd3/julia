@@ -340,6 +340,13 @@ function invoke_interp_compiler(interp, fname::Symbol, args...)
     end
 end
 
+# The generator of a method whose body is produced by `Core.GeneratedFunctionTransform`,
+# implemented by the `Compiler` module the interpreter belongs to.
+function (g::Core.GeneratedFunctionTransform)(world::UInt, source::Method, @nospecialize args...)
+    interp = g.gen(world)
+    return invoke_interp_compiler(interp, :generate_transformed_body, interp, world, source, args)
+end
+
 function invoke_mt_compiler(mt, fname::Symbol, args...)
     if mt === nothing
         return invoke_default_compiler(fname, args...)

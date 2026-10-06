@@ -4258,6 +4258,66 @@ The current differences are:
 Core.finalizer
 
 """
+    Core.GeneratedFunctionTransform(gen)
+
+A generator for a [`@generated`](@ref) method whose body is compiled by a custom
+`Compiler.AbstractInterpreter`, instead of being an expression returned by user code.
+
+The generated method takes the function to call as its first argument, followed by its
+arguments:
+
+```julia
+Base.Experimental.@MethodTable MT
+Base.Experimental.@overlay MT Base.sin(x::Float64) = 42.0
+
+struct MyInterp <: Compiler.AbstractInterpreter ... end  # with `MT` as its method table
+@eval function overdub(f, args...)
+    \$(Expr(:meta, :generated_only))
+    \$(Expr(:meta, :generated, Core.GeneratedFunctionTransform(world -> MyInterp(; world))))
+end
+overdub(sin, 1.0) # 42.0
+```
+
+When a specialization `overdub(f, args...)` is needed in a world `world`:
+
+1. `interp = gen(world)` must return an interpreter that infers in `world` and defines
+   `Compiler.codegen_cache`, so that the code it produces can be invoked.
+2. `f(args...)` is looked up in the method table of `interp`, then inferred and
+   optimized with `interp`, producing a `CodeInstance` `ci` owned by
+   `Compiler.cache_owner(interp)`.
+3. The body of the specialization is `invoke(f, ci, args...)`.
+
+The body is cached like any generated body and regenerated when `ci` is invalidated, for
+example when `f` or a method it calls is redefined. Callers see the return type and
+effects of `ci`, except that the call is never `nothrow` or `:consistent`.
+
+Unlike other generators, which run in the world their method was defined in, this one
+runs in `world`, so `gen`, the interpreter's methods and the lookup see every method
+defined by then. The interpreter's own methods are not tracked as dependencies, though:
+a tool whose transformation can change within a session should change its `cache_owner`
+when it does.
+
+A transformed body may call the generated method again for a callee whose transformed
+body leads back to the first, as with mutually recursive functions. The call that would
+close such a cycle is not transformed at compile time. It is inferred as returning `Any`
+and dispatched at run time, where it uses the completed body.
+
+Limitations:
+- As for every generator, the arguments' types must be concrete; a caller that does not
+  know them infers `Any`.
+- Methods with keyword arguments are not supported.
+- Adding a method to an overlay method table does not invalidate bodies generated before
+  it; replacing a method does.
+- A package image can only carry `ci` if the interpreter keeps its code
+  (`Compiler.may_discard_trees(::MyInterp) = false`). Otherwise the body is regenerated
+  at run time.
+
+!!! warning
+    This feature is experimental and its interface may change in future releases.
+"""
+Core.GeneratedFunctionTransform
+
+"""
     Core._task(f, size) -> Task
     Core._task(f, size, invoked) -> Task
 

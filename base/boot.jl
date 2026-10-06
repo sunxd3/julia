@@ -1017,6 +1017,14 @@ end
 # code transformations, such as a Cassette-like system.
 abstract type CachedGenerator end
 
+# A generator that enters the compiler, with the `Compiler.AbstractInterpreter` returned
+# by `gen(world)`, instead of running user code: the runtime calls it as it enters
+# inference (`jl_code_for_staged`), and its body is `invoke` of the result.
+struct GeneratedFunctionTransform <: CachedGenerator
+    gen # (world::UInt) -> Compiler.AbstractInterpreter
+    GeneratedFunctionTransform(@nospecialize(gen)) = new(gen)
+end
+
 NamedTuple() = NamedTuple{(),Tuple{}}(())
 
 eval(Core, :(NamedTuple{names}(args::Tuple) where {names} =

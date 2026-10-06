@@ -113,3 +113,35 @@ map(f, t::Tuple{Any}) @ Base tuple.jl:358
 ```
 
 The line costs are in the left column. This includes the consequences of inlining and other forms of optimization.
+
+## Generated functions driven by a custom interpreter
+
+A `@generated` method normally obtains its body from a `Core.GeneratedFunctionStub`, i.e.
+from user code that returns an expression. A method whose generator is a
+`Core.GeneratedFunctionTransform` obtains it from a custom `AbstractInterpreter` instead:
+
+```@docs
+Core.GeneratedFunctionTransform
+```
+
+The pieces involved:
+
+- `jl_code_for_staged` (`src/method.c`) runs this generator kind in the requested world
+  with `in_pure_callback` cleared. Other generators run in their method's
+  `primary_world` as pure callbacks, which would keep the inner inference from seeing
+  the world counter it must cap its results at.
+- The call method in `base/reflection.jl` constructs `interp = gen(world)` and forwards
+  to `generate_transformed_body` (`Compiler/src/generated_function_transform.jl`) of the
+  `Compiler` module `interp` belongs to, so an interpreter written against a separately
+  loaded `Compiler` is served by that module.
+- `generate_transformed_body` runs `typeinf_ext_toplevel` on the looked-up
+  `MethodInstance` and returns the stub with the resulting `CodeInstance` as its edge,
+  its world range bounded by that instance and by the lookup. As a `CachedGenerator`,
+  the stub is cached on the generated method's `MethodInstance` and registered as a
+  backedge of the inner `MethodInstance`.
+- In a caller, inference resolves `invoke` with a constant `CodeInstance` to
+  `InvokeCICallInfo` (`abstract_invoke`), and `compileable_specialization` keeps a
+  `CodeInstance` of another owner as the target of the resulting `:invoke`.
+- `typeinf_ext` does not recur on a `MethodInstance` this thread is already inferring
+  (`jl_engine_hasreserved`, as `jl_type_infer` does), which bounds recursion through the
+  generated method.

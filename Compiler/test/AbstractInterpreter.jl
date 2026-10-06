@@ -866,3 +866,158 @@ end
 @test invoke(foreign_invoke_self, foreign_invoke_self_ci, 0) == -10
 @test foreign_invoke_self(0) == 10
 @test foreign_invoke_self(1) == -10
+
+# `Core.GeneratedFunctionTransform` infers the call with the interpreter returned by its
+# factory and invokes the resulting `CodeInstance`; the inner `CodeInstance` is an edge of
+# the generated body, so redefinitions regenerate it.
+@eval function gft_overdub(f, args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+gft_target(x::Int) = owner_swap_leaf(x) * 10
+@test gft_target(2) == 30
+@test gft_overdub(gft_target, 2) == 10
+gft_caller(x::Int) = gft_overdub(gft_target, x) + 1
+@test Base.return_types(gft_caller, (Int,)) == Any[Int]
+let src = code_typed1(gft_caller, (Int,))
+    @test count(src.code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] isa CodeInstance && stmt.args[1].owner === OwnerSwapInterp
+    end == 1
+end
+@test gft_caller(2) == 11
+gft_target(x::Int) = owner_swap_leaf(x) * 100
+@test gft_overdub(gft_target, 2) == 100
+@test gft_caller(2) == 101
+@test_throws "no unique method" gft_overdub(gft_target, "not an Int")
+# varargs are splatted back out: zero, one and several trailing arguments
+const gft_va_zero = Ref(0)  # keeps the zero-argument call from being constant folded
+gft_va() = owner_swap_leaf(gft_va_zero[])
+gft_va(x::Int) = owner_swap_leaf(x)
+gft_va(x::Int, y::Int, z::Int) = owner_swap_leaf(x) + y * z
+@test gft_overdub(gft_va) == -1
+@test gft_overdub(gft_va, 5) == 4
+@test gft_overdub(gft_va, 5, 2, 3) == 10
+gft_va_caller(x::Int) = gft_overdub(gft_va) + gft_overdub(gft_va, x) + gft_overdub(gft_va, x, x, x)
+@test gft_va_caller(2) == -1 + 1 + 5
+let src = code_typed1(gft_va_caller, (Int,))
+    @test count(src.code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] isa CodeInstance && stmt.args[1].owner === OwnerSwapInterp
+    end == 3
+    @test !any(src.code) do @nospecialize stmt
+        isexpr(stmt, :call) && stmt.args[1] === GlobalRef(Core, :_apply_iterate)
+    end
+end
+# a fixed-arity generated method works the same way
+@eval function gft_overdub_fixed(f, x)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+@test gft_overdub_fixed(gft_target, 2) == 100
+# an anonymous argument has no slot name to reuse; the others keep theirs
+@eval function gft_overdub_anon(f, ::Int)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+@test gft_overdub_anon(gft_target, 2) == 100
+@test only(code_lowered(gft_overdub_anon, (typeof(gft_target), Int))).slotnames == [Symbol("#self#"), :f, Symbol("#unused2")]
+@test only(code_lowered(gft_overdub, (typeof(gft_target), Int))).slotnames == [Symbol("#self#"), :f, :args]
+@eval function gft_overdub_clash(f, var"#unused3", ::Int)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+@test_throws "is reserved" gft_overdub_clash(gft_va, 2, 3)
+# static parameters and a `Type` callee
+@eval function gft_overdub_sp(f, x::T) where {T<:Integer}
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+@test gft_overdub_sp(gft_target, 2) == 100
+@test gft_overdub_sp(Float64, 2) === 2.0
+# when the varargs are the only argument, the callee is the first of them
+@eval function gft_va_only(args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+@test gft_va_only(gft_target, 2) == 100
+@test gft_va_only(gft_va) == -1
+@test gft_va_only(gft_va, 5, 2, 3) == 10
+gft_va_only_caller(x::Int) = gft_va_only(gft_target, x) + gft_va_only(gft_va) + gft_va_only(gft_va, x, x, x)
+@test gft_va_only_caller(2) == 100 - 1 + 5
+let src = code_typed1(gft_va_only_caller, (Int,))
+    @test count(src.code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] isa CodeInstance && stmt.args[1].owner === OwnerSwapInterp
+    end == 3
+    @test !any(src.code) do @nospecialize stmt
+        isexpr(stmt, :call) && stmt.args[1] === GlobalRef(Core, :_apply_iterate)
+    end
+end
+# there must be a callee
+@test_throws "must be called with the function to call" gft_va_only()
+# `gen` must return an interpreter for the requesting world with its own cache
+@newinterp GFTNoCodegenInterp
+for (name, gen) in ((:gft_bad_type, (world::UInt) -> world),
+                    (:gft_bad_codegen, (world::UInt) -> GFTNoCodegenInterp(; world)),
+                    (:gft_bad_world, (world::UInt) -> OwnerSwapInterp(; world = world - 1)))
+    @eval function $name(f, args...)
+        $(Expr(:meta, :generated_only))
+        $(Expr(:meta, :generated, Core.GeneratedFunctionTransform(gen)))
+    end
+end
+@test_throws "Expected AbstractInterpreter" gft_bad_type(gft_target, 2)
+@test_throws "must define a `Compiler.codegen_cache`" gft_bad_codegen(gft_target, 2)
+@test_throws "returned an interpreter for world" gft_bad_world(gft_target, 2)
+# keyword arguments are refused: the method holding the body receives them first
+@eval function gft_overdub_kw(f, args...; k = 1)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> OwnerSwapInterp(; world))))
+end
+@test_throws "keyword arguments are not supported" gft_overdub_kw(gft_target, 2)
+@test_throws "keyword arguments are not supported" gft_overdub_kw(gft_target, 2; k = 3)
+# recursion through the generated method: the transformed body of one callee reaches the
+# generated method for another, whose transformed body reaches the first. Inference does
+# not recur on a `MethodInstance` the thread is already inferring, so the request that
+# would close the cycle gets no body; that call site is compiled without knowledge of its
+# result, and at run time it finds the finished body.
+const gft_gen_count = Ref(0)
+@eval function gft_overdub_counting(f, args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform(
+        (world::UInt) -> (gft_gen_count[] += 1; OwnerSwapInterp(; world)))))
+end
+# passing the generated function as its own callee is ordinary nested generation:
+# `gft_overdub_counting(gft_overdub_counting, f, x)` transforms the call `gft_overdub_counting(f, x)`, a
+# different specialization, which is generated in turn
+@test gft_overdub_counting(gft_overdub_counting, gft_target, 2) == 100
+@test gft_gen_count[] == 2
+@test gft_overdub_counting(gft_overdub_counting, gft_target, 2) == 100
+@test gft_gen_count[] == 2
+gft_gen_count[] = 0
+gft_ping(n::Int) = n <= 0 ? 0 : gft_overdub_counting(gft_pong, n - 1) + 1
+gft_pong(n::Int) = n <= 0 ? 0 : gft_overdub_counting(gft_ping, n - 1) + 1
+@test gft_overdub_counting(gft_ping, 4) == 4
+@test gft_gen_count[] == 3       # `ping`, `pong`, and the refused request for `ping` again
+gft_self(n::Int) = n <= 0 ? 0 : gft_overdub_counting(gft_self, n - 1) + 1
+gft_gen_count[] = 0
+@test gft_overdub_counting(gft_self, 3) == 3
+@test gft_gen_count[] == 2       # generated once, and the refused request
+# a callee calling itself directly is an ordinary inference cycle, not a generator cycle
+gft_fact(n::Int) = n <= 1 ? 1 : n * gft_fact(n - 1)
+gft_gen_count[] = 0
+@test gft_overdub_counting(gft_fact, 5) == 120
+@test gft_gen_count[] == 1
+# the bound holds for an owner that is a fresh, egal object on every request
+struct GFTOwnerKey; version::Int; end
+@newinterp GFTEgalOwnerInterp
+Compiler.cache_owner(::GFTEgalOwnerInterp) = GFTOwnerKey(1)
+const gft_egal_codegen = IdDict{CodeInstance,CodeInfo}()
+Compiler.codegen_cache(::GFTEgalOwnerInterp) = gft_egal_codegen
+@eval function gft_overdub_egal(f, args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform(
+        (world::UInt) -> (gft_gen_count[] += 1; gft_gen_count[] > 20 && error("unbounded"); GFTEgalOwnerInterp(; world)))))
+end
+gft_egal_ping(n::Int) = n <= 0 ? 0 : gft_overdub_egal(gft_egal_pong, n - 1) + 1
+gft_egal_pong(n::Int) = n <= 0 ? 0 : gft_overdub_egal(gft_egal_ping, n - 1) + 1
+gft_gen_count[] = 0
+@test gft_overdub_egal(gft_egal_ping, 4) == 4
+@test gft_gen_count[] == 3

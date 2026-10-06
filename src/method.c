@@ -804,8 +804,17 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
     size_t validated_world = jl_atomic_load_acquire(&jl_world_counter);
 
     JL_TRY {
-        ct->ptls->in_pure_callback = 1;
-        ct->world_age = jl_atomic_load_relaxed(&def->primary_world);
+        if (jl_typetagis(generator, jl_generated_function_transform_type)) {
+            // this generator enters the compiler rather than running user code: run it in
+            // the requested world, and not as a pure callback, so that the inner inference
+            // sees the world counter it must cap its results at
+            ct->ptls->in_pure_callback = 0;
+            ct->world_age = world;
+        }
+        else {
+            ct->ptls->in_pure_callback = 1;
+            ct->world_age = jl_atomic_load_relaxed(&def->primary_world);
+        }
         if (ct->world_age > jl_atomic_load_acquire(&jl_world_counter))
             jl_error("The generator method cannot run until it is added to a method table.");
 
