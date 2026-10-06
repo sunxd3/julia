@@ -749,3 +749,31 @@ using REPL.REPLCompletions: completions
     Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_NOT_REQUIRED)
     true
 end
+
+
+# `invoke(f, ci, args...)` with a `CodeInstance` from another `cache_owner` must keep
+# invoking exactly that `CodeInstance`, even once the native cache holds code for the
+# same `MethodInstance` (which the inlining pass otherwise prefers as invoke target).
+@newinterp OwnerSwapInterp
+@MethodTable OWNER_SWAP_MT
+Compiler.method_table(interp::OwnerSwapInterp) = Compiler.OverlayMethodTable(Compiler.get_inference_world(interp), OWNER_SWAP_MT)
+global owner_swap_codegen::IdDict{CodeInstance,CodeInfo} = IdDict{CodeInstance,CodeInfo}()
+Compiler.codegen_cache(::OwnerSwapInterp) = owner_swap_codegen
+owner_swap_leaf(x::Int) = x + 1
+@overlay OWNER_SWAP_MT owner_swap_leaf(x::Int) = x - 1
+owner_swap_target(x::Int) = owner_swap_leaf(x) * 10
+const owner_swap_ci = let interp = OwnerSwapInterp()
+    @test owner_swap_target(2) == 30 # populate the native cache first
+    mi = Base.method_instance(owner_swap_target, (Int,))
+    Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_ABI)
+end
+@test owner_swap_ci.owner === OwnerSwapInterp
+@test invoke(owner_swap_target, owner_swap_ci, 2) == 10
+owner_swap_wrapper(x::Int) = invoke(owner_swap_target, owner_swap_ci, x)
+@test Base.return_types(owner_swap_wrapper, (Int,)) == Any[Int]
+let src = code_typed1(owner_swap_wrapper, (Int,))
+    @test count(src.code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] === owner_swap_ci
+    end == 1
+end
+@test owner_swap_wrapper(2) == 10
