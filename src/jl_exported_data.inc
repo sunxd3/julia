@@ -53,6 +53,7 @@
     XX(function_type, jl_datatype_t*) \
     XX(binding_type, jl_datatype_t*) \
     XX(binding_partition_type, jl_datatype_t*) \
+    XX(generated_function_transform_type, jl_datatype_t*) \
     XX(globalref_type, jl_datatype_t*) \
     XX(gotoifnot_type, jl_datatype_t*) \
     XX(enternode_type, jl_datatype_t*) \
