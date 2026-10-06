@@ -791,3 +791,78 @@ let src = code_typed1(owner_swap_const, (Int,))
     end == 1
 end
 @test owner_swap_const(0) == 10
+
+# A CodeInstance owned by another interpreter that is `invoke`d from natively compiled
+# code must be emitted from its own source, not replaced by a native inference of its
+# MethodInstance (the two bodies differ here through an overlay method table), even when
+# its owner keeps it in an ephemeral cache that is not on the `mi.cache` chain.
+@MethodTable FOREIGN_INVOKE_MT
+foreign_invoke_leaf(x::Int) = x + 1
+@overlay FOREIGN_INVOKE_MT foreign_invoke_leaf(x::Int) = x - 1
+foreign_invoke_target(x::Int) = foreign_invoke_leaf(x) * 10
+@newinterp ForeignInvokeEphInterp true
+Compiler.method_table(interp::ForeignInvokeEphInterp) =
+    Compiler.OverlayMethodTable(Compiler.get_inference_world(interp), FOREIGN_INVOKE_MT)
+const foreign_invoke_eph_codegen = IdDict{CodeInstance,CodeInfo}()
+Compiler.codegen_cache(::ForeignInvokeEphInterp) = foreign_invoke_eph_codegen
+const foreign_invoke_eph_ci = let interp = ForeignInvokeEphInterp()
+    mi = Base.method_instance(foreign_invoke_target, (Int,))
+    # inferred but not compiled: the native JIT has to emit it when compiling the caller
+    Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_NOT_REQUIRED)
+end
+foreign_invoke_eph_caller(x::Int) = invoke(foreign_invoke_target, foreign_invoke_eph_ci, x)
+@test iszero(@ccall jl_mi_cache_has_ci(Compiler.get_ci_mi(foreign_invoke_eph_ci)::Any,
+                                       foreign_invoke_eph_ci::Any)::Cint)
+@test foreign_invoke_eph_caller(2) == 10
+@test foreign_invoke_eph_ci.invoke != C_NULL
+@test foreign_invoke_target(2) == 30
+
+# When the foreign CodeInstance has no retrievable source, the caller must not run the
+# native body in its place either: the call fails as `invoke(f, ci, args...)` does.
+@newinterp ForeignInvokeOwnedInterp
+Compiler.method_table(interp::ForeignInvokeOwnedInterp) =
+    Compiler.OverlayMethodTable(Compiler.get_inference_world(interp), FOREIGN_INVOKE_MT)
+const foreign_invoke_owned_codegen = IdDict{CodeInstance,CodeInfo}()
+Compiler.codegen_cache(::ForeignInvokeOwnedInterp) = foreign_invoke_owned_codegen
+const foreign_invoke_owned_ci = let interp = ForeignInvokeOwnedInterp()
+    mi = Base.method_instance(foreign_invoke_target, (Int,))
+    Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_NOT_REQUIRED)
+end
+@test !iszero(@ccall jl_mi_cache_has_ci(Compiler.get_ci_mi(foreign_invoke_owned_ci)::Any,
+                                        foreign_invoke_owned_ci::Any)::Cint)
+@atomic foreign_invoke_owned_ci.inferred = nothing
+empty!(foreign_invoke_owned_codegen)
+foreign_invoke_owned_caller(x::Int) = invoke(foreign_invoke_target, foreign_invoke_owned_ci, x)
+@test_throws "Failed to invoke or compile external codeinst" foreign_invoke_owned_caller(2)
+@test_throws "Failed to invoke or compile external codeinst" invoke(foreign_invoke_target, foreign_invoke_owned_ci, 2)
+@test foreign_invoke_target(2) == 30
+
+# A foreign target whose MethodInstance needs its static parameters at run time takes
+# the `needsparams` path of `emit_invoke`, which used to dispatch on the MethodInstance
+# (running the native body). Such a CodeInstance has no valid ABI for the drain loops
+# (`has_valid_abi_sparams`), so it cannot be given code and the call must fail instead.
+foreign_invoke_sp_target(x::Vector{T}) where {T} = foreign_invoke_leaf(length(x)) * 10
+const foreign_invoke_sp_ci = let interp = ForeignInvokeEphInterp()
+    mi = Base.method_instance(foreign_invoke_sp_target, (Vector,))
+    @test !Compiler.has_valid_abi_sparams(mi)
+    Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_ABI)
+end
+foreign_invoke_sp_caller(x::Vector) = invoke(foreign_invoke_sp_target, foreign_invoke_sp_ci, x)
+let src = only(Base.code_typed(foreign_invoke_sp_caller, (Vector{Int},)))[1]
+    # the edge is the foreign CodeInstance itself
+    @test any(s -> Meta.isexpr(s, :invoke) && s.args[1] === foreign_invoke_sp_ci, src.code)
+end
+@test foreign_invoke_sp_ci.invoke == C_NULL
+@test_throws "Failed to invoke or compile external codeinst" foreign_invoke_sp_caller([1, 2])
+@test foreign_invoke_sp_target([1, 2]) == 30
+
+# A body that `invoke`s a foreign CodeInstance of its own MethodInstance must call that
+# instance, not take the self-recursion shortcut to its own (native) code.
+foreign_invoke_self(x::Int) = x <= 0 ? foreign_invoke_leaf(x) * 10 : invoke(foreign_invoke_self, foreign_invoke_self_ci, x - 1)
+const foreign_invoke_self_ci = let interp = ForeignInvokeEphInterp()
+    mi = Base.method_instance(foreign_invoke_self, (Int,))
+    Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_ABI)
+end
+@test invoke(foreign_invoke_self, foreign_invoke_self_ci, 0) == -10
+@test foreign_invoke_self(0) == 10
+@test foreign_invoke_self(1) == -10

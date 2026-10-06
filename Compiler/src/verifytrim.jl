@@ -1,7 +1,7 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 import ..Compiler: verify_typeinf_trim, NativeInterpreter, argtypes_to_type, compileable_specialization_for_call,
-    threads_deferred_call_type, is_threads_call_def
+    threads_deferred_call_type, is_threads_call_def, is_native_owner
 
 using ..Compiler:
      # operators
@@ -315,7 +315,9 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                 haskey(parents, edge) || (parents[edge] = (codeinst, i))
                 edge in inspected && continue
                 edge_mi = get_ci_mi(edge)
-                if edge_mi === edge.def
+                # the compiled CodeInstance stands in for `edge` only if it is the native
+                # compiler's: one of another owner holds its own code for `edge_mi`
+                if edge_mi === edge.def && is_native_owner(edge.owner)
                     ci = get(caches, edge_mi, nothing)
                     ci isa CodeInstance && continue # assume that only this_world matters for trim
                 end

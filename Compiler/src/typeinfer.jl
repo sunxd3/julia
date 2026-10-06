@@ -2033,11 +2033,11 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
                      ci_has_invoke(edge) || ci_has_source(workqueue.interp, edge) ||
                      !iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), get_ci_mi(edge), edge)))
                 # The globally-cached check keeps batches closed under invoke
-                # edges even when the edge's source lives only in another
-                # interpreter's codegen cache (activation clears `inferred`,
-                # so `ci_has_source` cannot see it): the drain loops re-infer
-                # such edges, preventing them from silently leaking to
-                # permanent `tojlinvoke` fallbacks at link time. Uncached
+                # edges even when the edge's source is not visible from here
+                # (activation clears `inferred`, so `ci_has_source` cannot see
+                # it): the drain loops re-infer such an edge if they own it,
+                # and otherwise emit it from its own source or leave it to the
+                # runtime (see `is_foreign_owned`). Uncached
                 # speculative edges must NOT be enqueued unconditionally:
                 # resolved invoke edges of recursion that inference widened
                 # (e.g. self-recursion with a growing tuple argument) form an
@@ -2157,6 +2157,11 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
         end
         src = ci_get_source(interp, callee)
         if !isa(src, CodeInfo)
+            if is_foreign_owned(interp, callee)
+                # no code is emitted for it, so the edge needs no root here either
+                markinspected!(workqueue, callee)
+                continue
+            end
             newcallee = typeinf_ext(workqueue.interp, callee.def, source_mode) # always SOURCE_MODE_ABI
             if newcallee isa CodeInstance
                 callee === ci && (ci = newcallee) # ci stopped meeting the requirements after typeinf_ext last checked, try again with newcallee
@@ -2172,21 +2177,26 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
         sptypes = sptypes_from_meth_instance(mi)
         collectinvokes!(workqueue, src, sptypes)
         if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
-            valid_worlds = WorldRange(get_inference_world(workqueue.interp))
-            cached = find_equivalent_cached_ci(
-                workqueue.interp, callee, valid_worlds)
-            if cached === nothing
-                # make sure callee is cached, as required by jl_add_codeinsts_to_jit
-                code_cache(workqueue.interp)[mi] = callee
+            if is_foreign_owned(workqueue.interp, callee)
+                # its owner's cache is not reachable from here, so root it generically
+                jit_cache_root!(nothing, callee)
             else
-                # use an existing CI from the cache, if there is available one that is compatible
-                callee === ci && (ci = cached)
-                callee = cached
+                valid_worlds = WorldRange(get_inference_world(workqueue.interp))
+                cached = find_equivalent_cached_ci(
+                    workqueue.interp, callee, valid_worlds)
+                if cached === nothing
+                    # make sure callee is cached, as required by jl_add_codeinsts_to_jit
+                    code_cache(workqueue.interp)[mi] = callee
+                else
+                    # use an existing CI from the cache, if there is available one that is compatible
+                    callee === ci && (ci = cached)
+                    callee = cached
+                end
+                # `callee` is about to be emitted while absent from the native
+                # `mi.cache` chain; the executable cache it lives in must root it
+                # for the lifetime of the process (see `jit_cache_root!`).
+                jit_cache_root!(code_cache(workqueue.interp), callee)
             end
-            # `callee` is about to be emitted while absent from the native
-            # `mi.cache` chain; the executable cache it lives in must root it
-            # for the lifetime of the process (see `jit_cache_root!`).
-            jit_cache_root!(code_cache(workqueue.interp), callee)
         end
         push!(codeinsts, callee)
         push!(srcs, src)
@@ -2254,6 +2264,14 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             # now make sure everything has source code, if desired
             if use_const_api(callee)
                 src = codeinfo_for_const(interp, mi, WorldRange(callee.min_world, callee.max_world), callee.edges, callee.rettype_const)
+            elseif is_foreign_owned(interp, callee)
+                # emit it from its own source, or leave its `:invoke` edges to the
+                # runtime (under `--trim`, the verifier reports them as unresolved)
+                src = ci_get_source(interp, callee)
+                if !isa(src, CodeInfo)
+                    markinspected!(workqueue, callee)
+                    continue
+                end
             else
                 src = get(interp.codegen, callee, nothing)
                 if src === nothing
@@ -2274,7 +2292,8 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                 collectinvokes!(workqueue, src, sptypes; invokelatest_queue,
                                 enqueue_unprepared_invokes, external_linkage)
                 # try to reuse an existing CodeInstance from before to avoid making duplicates in the cache
-                if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
+                if !is_foreign_owned(interp, callee) &&
+                        iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
                     cached = find_equivalent_cached_ci(
                         interp, callee, WorldRange(world))
                     if cached === nothing

@@ -2103,6 +2103,115 @@ precompile_test_harness("custom MethodTable dispatch status") do load_path
     end
 end
 
+precompile_test_harness("foreign CodeInstance invoke edge") do load_path
+    # Native code in a package image that `:invoke`s a CodeInstance owned by another
+    # interpreter must carry that CodeInstance's own body, not a native re-inference of
+    # its MethodInstance (the two differ here through an overlay method table). Covers an
+    # owner that publishes on the `mi.cache` chain and one with an ephemeral cache.
+    newinterp_path = abspath(joinpath(@__DIR__, "../Compiler/test/newinterp.jl"))
+    for (pkg, ephemeral, source_mode) in (("ForeignInvokeOwned", false, "SOURCE_MODE_ABI"),
+                                          ("ForeignInvokeEph", true, "SOURCE_MODE_NOT_REQUIRED"))
+        Interp = Symbol(pkg, "Interp")
+        write(joinpath(load_path, "$pkg.jl"),
+            """
+            module $pkg
+            import Base.Compiler: Compiler
+            include($(repr(newinterp_path)))
+            @newinterp $Interp $ephemeral
+            Base.Experimental.@MethodTable MT
+            Compiler.method_table(interp::$Interp) =
+                Compiler.OverlayMethodTable(Compiler.get_inference_world(interp), MT)
+            const CODEGEN = IdDict{Core.CodeInstance,Core.CodeInfo}()
+            Compiler.codegen_cache(::$Interp) = CODEGEN
+            leaf(x::Int) = x + 1
+            Base.Experimental.@overlay MT leaf(x::Int) = x - 1
+            target(x::Int) = leaf(x) * 10
+            const fci = Compiler.typeinf_ext_toplevel($Interp(),
+                Base.method_instance(target, (Int,)), Compiler.$source_mode)
+            caller(x::Int) = invoke(target, fci, x) + 1
+            precompile(caller, (Int,))
+            end
+            """)
+        Base.compilecache(Base.PkgId(pkg))
+        @eval using $(Symbol(pkg))
+        M = invokelatest(getglobal, @__MODULE__, Symbol(pkg))
+        invokelatest() do
+            ci = M.fci
+            @test ci.owner === getglobal(M, Interp)
+            mi = Base.get_ci_mi(ci)
+            @test iszero(@ccall jl_mi_cache_has_ci(mi::Any, ci::Any)::Cint) == ephemeral
+            # the foreign-owned CodeInstance got native code in the image
+            @test ci.invoke != C_NULL
+            @test M.caller(2) == 11
+            @test M.target(2) == 30
+        end
+    end
+end
+
+precompile_test_harness("foreign CodeInstance invoke edge, no source") do load_path
+    # A non-inlineable foreign target normally has `inferred === nothing` (its owner
+    # discards the IR), so the image driver has no source for it. It must skip it,
+    # not re-infer it natively: after loading the image the call then either runs the
+    # foreign body (if the owner kept the IR) or fails as `invoke(f, ci, x)` does, but
+    # never yields the native result. `outer` reaches the edge through a branch that
+    # is never taken at run time.
+    newinterp_path = abspath(joinpath(@__DIR__, "../Compiler/test/newinterp.jl"))
+    for (pkg, source_mode, keep_ir) in (("ForeignInvokeBigABI", "SOURCE_MODE_ABI", false),
+                                        ("ForeignInvokeBigNR", "SOURCE_MODE_NOT_REQUIRED", false),
+                                        ("ForeignInvokeBigKeep", "SOURCE_MODE_NOT_REQUIRED", true))
+        Interp = Symbol(pkg, "Interp")
+        write(joinpath(load_path, "$pkg.jl"),
+            """
+            module $pkg
+            import Base.Compiler: Compiler
+            include($(repr(newinterp_path)))
+            @newinterp $Interp
+            Base.Experimental.@MethodTable MT
+            Compiler.method_table(interp::$Interp) =
+                Compiler.OverlayMethodTable(Compiler.get_inference_world(interp), MT)
+            const CODEGEN = IdDict{Core.CodeInstance,Core.CodeInfo}()
+            Compiler.codegen_cache(::$Interp) = CODEGEN
+            Compiler.may_discard_trees(::$Interp) = $(!keep_ir)
+            leaf(x::Int) = x + 1
+            Base.Experimental.@overlay MT leaf(x::Int) = x - 1
+            @noinline helper(x) = sum(sin(x + i) for i in 1:10)
+            function target(x::Int)
+                s = 0.0
+                for i in 1:100; s += helper(x * i)^2 + cos(s); end
+                io = IOBuffer(); print(io, s > 3 ? string(s) : repr(s))
+                return leaf(x) * 10
+            end
+            const fci = Compiler.typeinf_ext_toplevel($Interp(),
+                Base.method_instance(target, (Int,)), Compiler.$source_mode)
+            caller(x::Int) = invoke(target, fci, x) + 1
+            outer(flag::Bool, x::Int) = flag ? caller(x) : 0
+            precompile(caller, (Int,))
+            precompile(outer, (Bool, Int))
+            end
+            """)
+        Base.compilecache(Base.PkgId(pkg))
+        @eval using $(Symbol(pkg))
+        M = invokelatest(getglobal, @__MODULE__, Symbol(pkg))
+        invokelatest() do
+            ci = M.fci
+            @test ci.owner === getglobal(M, Interp)
+            @test (ci.inferred !== nothing) == keep_ir
+            @test M.outer(false, 2) == 0
+            GC.gc(true)
+            if keep_ir
+                @test ci.invoke != C_NULL
+                @test M.caller(2) == 11
+                @test M.outer(true, 2) == 11
+            else
+                @test ci.invoke == C_NULL
+                @test_throws "Failed to invoke or compile external codeinst" M.caller(2)
+                @test_throws "Failed to invoke or compile external codeinst" M.outer(true, 2)
+            end
+            @test M.target(2) == 30
+        end
+    end
+end
+
 precompile_test_harness("DynamicExpressions") do load_path
     # https://github.com/JuliaLang/julia/pull/47184#issuecomment-1364716312
     write(joinpath(load_path, "Float16MWE.jl"),
