@@ -10,14 +10,19 @@ typedef struct {
     jl_value_t *owner;
 } infer_key_t;
 
-typedef struct {
+typedef struct _reservation_info_t {
     int16_t tid;
     jl_code_instance_t *ci;
+    // the reservations of the same MethodInstance for other foreign owners
+    struct _reservation_info_t *next;
 } reservation_info_t;
 
 // map from MethodInstance to threadid that owns it currently for inference
 static htable_t native_reservations;
-// map from (foreign) owner to reservation map (which is a map from MI to threadid)
+// map from MethodInstance to its reservations for foreign owners, one per owner. The
+// owner of a reservation is that of its placeholder `ci`, which is live as long as the
+// reservation is (see `jl_engine_sweep`), and owners are compared by egal, as the caches
+// compare them.
 static htable_t foreign_reservations;
 
 static uv_mutex_t engine_lock; // n.b. this lock is only ever held briefly
@@ -25,41 +30,52 @@ static uv_cond_t engine_wait; // but it may be waiting a while in this state
 // vector of which threads are blocked and which lease they need
 static arraylist_t awaiting; // (this could be merged into ptls also)
 
-static htable_t *reservation_map_for_owner(jl_value_t *owner) JL_NOTSAFEPOINT
-{
-    if (owner == jl_nothing)
-        return &native_reservations;
-    htable_t **reservations = (htable_t **)ptrhash_bp(&foreign_reservations, owner);
-    if (*reservations == HT_NOTFOUND)
-        *reservations = htable_new((htable_t*)malloc_s(sizeof(htable_t)), 1);
-    return *reservations;
-}
-
 static reservation_info_t *get_reservation(jl_method_instance_t *mi, jl_value_t *owner) JL_NOTSAFEPOINT
 {
-    htable_t *reservations = reservation_map_for_owner(owner);
-    return (reservation_info_t *)ptrhash_get(reservations, mi);
+    if (owner == jl_nothing)
+        return (reservation_info_t *)ptrhash_get(&native_reservations, mi);
+    reservation_info_t *info = (reservation_info_t *)ptrhash_get(&foreign_reservations, mi);
+    if (info == HT_NOTFOUND)
+        return info;
+    for (; info != NULL; info = info->next) {
+        if (jl_egal(info->ci->owner, owner))
+            return info;
+    }
+    return (reservation_info_t *)HT_NOTFOUND;
 }
 
-static void remove_reservation(jl_method_instance_t *mi, jl_value_t *owner) JL_NOTSAFEPOINT
+// unlink `info` from the reservations of `mi`, without freeing it
+static void remove_reservation(jl_method_instance_t *mi, reservation_info_t *info) JL_NOTSAFEPOINT
 {
-    htable_t *reservations = reservation_map_for_owner(owner);
-    ptrhash_remove(reservations, mi);
+    if (info->ci->owner == jl_nothing) {
+        ptrhash_remove(&native_reservations, mi);
+        return;
+    }
+    reservation_info_t **head = (reservation_info_t **)ptrhash_bp(&foreign_reservations, mi);
+    if (*head == info && info->next == NULL) {
+        ptrhash_remove(&foreign_reservations, mi);
+        return;
+    }
+    reservation_info_t **link = head;
+    while (*link != info)
+        link = &(*link)->next;
+    *link = info->next;
 }
 
 static reservation_info_t *try_insert_reservation(infer_key_t key, reservation_info_t to_insert, int *inserted) JL_NOTSAFEPOINT
 {
-    htable_t *reservations = reservation_map_for_owner(key.owner);
-    reservation_info_t **record = (reservation_info_t **)ptrhash_bp(reservations, key.mi);
-    reservation_info_t *info = *record;
-    if (info == HT_NOTFOUND) {
-        info = (reservation_info_t *)malloc_s(sizeof(reservation_info_t));
-        *info = to_insert;
-        *record = info;
-        *inserted = 1;
+    reservation_info_t *info = get_reservation(key.mi, key.owner);
+    if (info != HT_NOTFOUND) {
+        *inserted = 0;
         return info;
     }
-    *inserted = 0;
+    info = (reservation_info_t *)malloc_s(sizeof(reservation_info_t));
+    *info = to_insert;
+    reservation_info_t **record = (reservation_info_t **)ptrhash_bp(
+        key.owner == jl_nothing ? &native_reservations : &foreign_reservations, key.mi);
+    info->next = *record == HT_NOTFOUND ? NULL : *record;
+    *record = info;
+    *inserted = 1;
     return info;
 }
 
@@ -84,7 +100,7 @@ jl_code_instance_t *jl_engine_reserve(jl_method_instance_t *mi, jl_value_t *owne
         while (1) {
             int inserted = 0;
             reservation_info_t *info = try_insert_reservation(
-                (infer_key_t){ mi, owner }, (reservation_info_t){ tid, ci }, &inserted
+                (infer_key_t){ mi, owner }, (reservation_info_t){ tid, ci, NULL }, &inserted
             );
             if (inserted)
                 break;
@@ -149,16 +165,23 @@ static int sweep_reservations(htable_t *h, jl_ptls_t *gc_all_tls_states) JL_NOTS
     for (size_t i = 0; i < h->size; i += 2) {
         if (h->table[i+1] == HT_NOTFOUND)
             continue;
-        reservation_info_t *info = (reservation_info_t *)h->table[i+1];
-        jl_code_instance_t *ci = info->ci;
-        if (!gc_marked(jl_astaggedvalue(ci)->bits.gc)) {
-            int16_t tid = info->tid;
+        // drop every reservation of this MethodInstance whose placeholder is dead
+        reservation_info_t **link = (reservation_info_t **)&h->table[i+1];
+        while (*link != NULL) {
+            reservation_info_t *info = *link;
+            if (gc_marked(jl_astaggedvalue(info->ci)->bits.gc)) {
+                link = &info->next;
+                continue;
+            }
+            *link = info->next;
+            jl_ptls_t ptls2 = gc_all_tls_states[info->tid];
+            ptls2->engine_nqueued--;
+            free(info);
+            any = 1;
+        }
+        if (h->table[i+1] == NULL) {
             h->table[i+1] = HT_NOTFOUND; // remove (tombstone)
             h->live--;
-            free(info);
-            jl_ptls_t ptls2 = gc_all_tls_states[tid];
-            ptls2->engine_nqueued--;
-            any = 1;
         }
     }
     return any;
@@ -168,13 +191,8 @@ void jl_engine_sweep(jl_ptls_t *gc_all_tls_states)
 {
     uv_mutex_lock(&engine_lock);
     int any = sweep_reservations(&native_reservations, gc_all_tls_states);
-    for (size_t i = 0; i < foreign_reservations.size; i += 2) {
-        if (foreign_reservations.table[i+1] == HT_NOTFOUND)
-            continue;
-        htable_t *reservations = (htable_t *)foreign_reservations.table[i+1];
-        if (sweep_reservations(reservations, gc_all_tls_states))
-            any = 1;
-    }
+    if (sweep_reservations(&foreign_reservations, gc_all_tls_states))
+        any = 1;
     if (any)
         uv_cond_broadcast(&engine_wait);
     uv_mutex_unlock(&engine_lock);
@@ -192,7 +210,7 @@ void jl_engine_fulfill(jl_code_instance_t *ci, jl_code_info_t *src)
     }
     assert(jl_atomic_load_relaxed(&ct->tid) == info->tid);
     ct->ptls->engine_nqueued--; // re-enables finalizers, but doesn't immediately try to run them
-    remove_reservation(mi, ci->owner);
+    remove_reservation(mi, info);
     free(info);
     uv_cond_broadcast(&engine_wait);
     uv_mutex_unlock(&engine_lock);

@@ -808,3 +808,22 @@ let src = code_typed1(owner_swap_const, (Int,))
     end == 1
 end
 @test owner_swap_const(0) == 10
+
+# inference's reservations of two cache owners that are not egal are separate, whatever
+# their hashes: two modules of one name have the same `objectid`
+@newinterp KeyedOwnerInterp
+Compiler.cache_owner(interp::KeyedOwnerInterp) = interp.meta
+keyed_owner_target(x::Int) = x + 1
+let a = Module(:SameName), b = Module(:SameName), mi = Base.method_instance(keyed_owner_target, (Int,))
+    @test a !== b && objectid(a) == objectid(b)
+    x, y = KeyedOwnerInterp(a), KeyedOwnerInterp(b)
+    ci = Compiler.engine_reserve(x, mi)
+    try
+        @test Compiler.engine_hasreserved(x, mi)
+        @test !Compiler.engine_hasreserved(y, mi)
+        @test Compiler.typeinf_ext(y, mi, Compiler.SOURCE_MODE_NOT_REQUIRED) isa CodeInstance
+    finally
+        Compiler.engine_reject(x, ci)
+    end
+    @test !Compiler.engine_hasreserved(x, mi)
+end
