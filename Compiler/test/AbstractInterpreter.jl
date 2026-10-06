@@ -777,3 +777,17 @@ let src = code_typed1(owner_swap_wrapper, (Int,))
     end == 1
 end
 @test owner_swap_wrapper(2) == 10
+# Whether the runtime can run a foreign-owned `CodeInstance` depends on its owner having
+# given it code, not on the arguments: unlike a native one the call is neither nothrow
+# nor consistent, so it is never folded (which would evaluate it through native dispatch)
+@test Base.infer_exception_type(owner_swap_wrapper, (Int,)) === ErrorException
+@test !Compiler.is_nothrow(Base.infer_effects(owner_swap_wrapper, (Int,)))
+@test !Compiler.is_consistent(Base.infer_effects(owner_swap_wrapper, (Int,)))
+owner_swap_offset(x::Int, y::Int) = invoke(owner_swap_target, owner_swap_ci, x) + y
+owner_swap_const(y::Int) = owner_swap_offset(2, y)
+let src = code_typed1(owner_swap_const, (Int,))
+    @test count(src.code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] === owner_swap_ci
+    end == 1
+end
+@test owner_swap_const(0) == 10
