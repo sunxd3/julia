@@ -846,6 +846,7 @@ JL_DLLEXPORT void jl_add_codeinsts_to_jit(jl_array_t *codeinsts, jl_array_t *src
 
 jl_value_t *jl_invoke_oneshot(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *meth) JL_CANSAFEPOINT;
 jl_value_t *jl_invoke_fromdispatch(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_invoke_codeinst(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_code_instance_t *codeinst) JL_CANSAFEPOINT;
 
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_uninit(jl_method_instance_t *mi, jl_value_t *owner) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
@@ -1482,6 +1483,7 @@ JL_DLLEXPORT int jl_mi_try_insert(jl_method_instance_t *mi,
 JL_DLLEXPORT jl_code_instance_t *jl_cached_uninferred(jl_code_instance_t *codeinst JL_PROPAGATES_ROOT, size_t world);
 JL_DLLEXPORT jl_code_instance_t *jl_cache_uninferred(jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_code_instance_t *checked, size_t world, jl_code_instance_t *newci JL_MAYBE_UNROOTED) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_for_uninferred(jl_method_instance_t *mi, jl_code_info_t *src) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_promote_ci_to_current(jl_code_instance_t *ci, size_t validated_world) JL_CANSAFEPOINT;
 JL_DLLEXPORT extern jl_value_t *(*const jl_rettype_inferred_addr)(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t min_world, size_t max_world) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT void jl_force_trace_compile_timing_enable(void) JL_NOTSAFEPOINT;
@@ -2159,6 +2161,13 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
 #define XX(name) extern JL_DLLEXPORT jl_sym_t *jl_##name;
 JL_COMMON_SYMBOLS(XX)
 #undef XX
+
+// Whether a CodeInstance with this `owner` was produced by the native compiler,
+// whose `--trim` namespace is `:trim` (re-stamped to `nothing` on serialization).
+STATIC_INLINE int jl_is_native_ci_owner(jl_value_t *owner) JL_NOTSAFEPOINT
+{
+    return owner == jl_nothing || owner == (jl_value_t*)jl_trim_sym;
+}
 
 JL_DLLEXPORT enum jl_memory_order jl_get_atomic_order(jl_sym_t *order, char loading, char storing);
 JL_DLLEXPORT enum jl_memory_order jl_get_atomic_order_checked(jl_sym_t *order, char loading, char storing);

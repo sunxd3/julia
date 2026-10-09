@@ -4824,16 +4824,7 @@ jl_value_t *jl_invoke_target(jl_value_t *F, jl_value_t **args, uint32_t nargs, j
     jl_code_instance_t *codeinst = (jl_code_instance_t*)target;
     assert(jl_atomic_load_relaxed(&codeinst->min_world) <= jl_current_task->world_age &&
            jl_current_task->world_age <= jl_atomic_load_relaxed(&codeinst->max_world));
-    jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
-    if (!invoke) {
-        jl_compile_codeinst(codeinst);
-        invoke = jl_atomic_load_acquire(&codeinst->invoke);
-    }
-    if (invoke)
-        return invoke(F, args, nargs, codeinst);
-    if (codeinst->owner != jl_nothing)
-        jl_error("Failed to invoke or compile external codeinst");
-    return jl_invoke(F, args, nargs, jl_get_ci_mi(codeinst));
+    return jl_invoke_codeinst(F, args, nargs, codeinst);
 }
 
 // Apply the modify function `op`, using the forwarded op_target from `:invoke_modify` if present
@@ -4889,6 +4880,24 @@ jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_me
     jl_value_t *ret = _jl_invoke(F, args, nargs, mfunc, world, TRIGGER_NONE);
     ct->world_age = last_age;
     return ret;
+}
+
+// Call `codeinst` itself, first waiting for any JIT compilation pending for it. Only
+// a CodeInstance of the native compiler is interchangeable with the others on its
+// MethodInstance, so only for one of those may this fall back to dispatching on it.
+// The caller is responsible for checking that `codeinst` is valid in its world.
+JL_DLLEXPORT jl_value_t *jl_invoke_codeinst(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_code_instance_t *codeinst)
+{
+    jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
+    if (!invoke) {
+        jl_compile_codeinst(codeinst);
+        invoke = jl_atomic_load_acquire(&codeinst->invoke);
+    }
+    if (invoke)
+        return invoke(F, args, nargs, codeinst);
+    if (!jl_is_native_ci_owner(codeinst->owner))
+        jl_error("Failed to invoke or compile external codeinst");
+    return jl_invoke(F, args, nargs, jl_get_ci_mi(codeinst));
 }
 
 STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_t **sig, size_t n) JL_NOTSAFEPOINT
