@@ -428,6 +428,101 @@ let mi = only(methods(doit54916)).specializations
     @test found
 end
 
+# A `CachedGenerator` may record a `CodeInstance` as a forward edge of the code it
+# returns, in an svec or in a Vector. The runtime must record it on the cached body and
+# turn it into a backedge on that instance's `MethodInstance` (it used to misread it as an
+# `invoke` signature pair), so that invalidating the instance regenerates the body.
+struct GeneratorCIEdge <: Core.CachedGenerator
+    vector::Bool # record the edge in a `Vector{Any}` rather than an svec
+end
+function (g::GeneratorCIEdge)(world::UInt, source::Method, self, f, arg)
+    mi = Base.specialize_method(Base._which(Tuple{f, arg}; world))
+    interp = Base.Compiler.NativeInterpreter(world)
+    ci = Base.Compiler.typeinf_ext_toplevel(interp, mi, Base.Compiler.SOURCE_MODE_ABI)
+    src = generate_lambda_ex(world, source, (:doit_ciedge, :func, :arg), (), :(func(arg)))
+    src.edges = g.vector ? Any[ci] : Core.svec(ci)
+    src.min_world = ci.min_world
+    src.max_world = ci.max_world
+    return src
+end
+@eval function doit_ciedge(func, arg)
+    $(Expr(:meta, :generated, GeneratorCIEdge(false)))
+    $(Expr(:meta, :generated_only))
+end
+@eval function doit_ciedge_vector(func, arg)
+    $(Expr(:meta, :generated, GeneratorCIEdge(true)))
+    $(Expr(:meta, :generated_only))
+end
+cached_body(f, types) = ccall(:jl_cached_uninferred, Any, (Any, UInt),
+    Base.method_instance(f, types).cache, Base.get_world_counter())
+ciedge_callee(x) = x + 1
+@test doit_ciedge(ciedge_callee, 1) == 2
+@test doit_ciedge_vector(ciedge_callee, 1) == 2
+const ciedge_bodies = (cached_body(doit_ciedge, (typeof(ciedge_callee), Int)),
+                       cached_body(doit_ciedge_vector, (typeof(ciedge_callee), Int)))
+for body in ciedge_bodies
+    @test body isa Core.CodeInstance
+    @test body.edges == Core.svec(Base.method_instance(ciedge_callee, (Int,)).cache)
+    @test body in Base.method_instance(ciedge_callee, (Int,)).backedges
+end
+ciedge_callee(x) = x + 2
+for body in ciedge_bodies
+    @test body.max_world != typemax(UInt) # the backedge capped the cached body
+end
+@test doit_ciedge(ciedge_callee, 1) == 3
+@test doit_ciedge_vector(ciedge_callee, 1) == 3
+
+# The edges a generator records may use every shape `store_backedges` understands: a
+# `(signature, MethodTable)` pair for an abstract dispatch, an `(nmatches, signature)`
+# marker followed by that many method matches, and a `PossiblyAmbiguous` marker in front
+# of either. All used to be misread as an `invoke` pair, passing a `MethodTable`, the
+# signature or the marker to `jl_method_instance_add_backedge`.
+struct GeneratorMixedEdges <: Core.CachedGenerator end
+const mixed_edges_runs = Ref(0)
+mixed_callee(x::Int) = x + 1
+function (::GeneratorMixedEdges)(world::UInt, source::Method, self, arg)
+    mixed_edges_runs[] += 1
+    mi = Base.specialize_method(Base._which(Tuple{typeof(mixed_callee), Int}; world))
+    src = generate_lambda_ex(world, source, (:doit_mixed, :arg), (), :(mixed_callee(arg)))
+    src.edges = Core.svec(Tuple{typeof(mixed_callee), Any}, Core.methodtable,
+                          Core.PossiblyAmbiguous(), 1, Tuple{typeof(mixed_callee), Int}, mi)
+    src.min_world = world
+    src.max_world = typemax(UInt)
+    return src
+end
+@eval function doit_mixed(arg)
+    $(Expr(:meta, :generated, GeneratorMixedEdges()))
+    $(Expr(:meta, :generated_only))
+end
+@test doit_mixed(1) == 2
+@test mixed_edges_runs[] == 1
+# a malformed edge list is an error, not a read past its end
+const bad_edges = Ref{Any}(nothing)
+struct GeneratorBadEdges <: Core.CachedGenerator end
+function (::GeneratorBadEdges)(world::UInt, source::Method, self, arg)
+    src = generate_lambda_ex(world, source, (:doit_bad_edges, :arg), (), :(arg))
+    src.edges = bad_edges[]
+    src.min_world = world
+    src.max_world = typemax(UInt)
+    return src
+end
+@eval function doit_bad_edges(arg)
+    $(Expr(:meta, :generated, GeneratorBadEdges()))
+    $(Expr(:meta, :generated_only))
+end
+bad_edges[] = Core.svec(Tuple{typeof(mixed_callee), Int})
+@test_throws "invoke signature without a callee" doit_bad_edges(1)
+bad_edges[] = Int[1, 2, 3]
+@test_throws "must be `nothing`, a `SimpleVector` or a `Vector{Any}`" doit_bad_edges(1)
+# a new method under the abstract signature reaches the cached body through the
+# `MethodTable` backedge, a replacement of the match through the `MethodInstance` one
+mixed_callee(x::Float64) = x - 1
+@test doit_mixed(1) == 2
+@test mixed_edges_runs[] == 2
+mixed_callee(x::Int) = x + 2
+@test doit_mixed(1) == 3
+@test mixed_edges_runs[] == 3
+
 # Test that writing a bad cassette-style pass gives the expected error (#49715)
 function generator49715(world, source, self, f, tt)
     tt = Base.type_parameter(tt)

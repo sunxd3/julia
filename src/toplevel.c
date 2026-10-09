@@ -513,15 +513,27 @@ static int jl_needs_lowering(jl_value_t *e) JL_NOTSAFEPOINT
 
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_for_uninferred(jl_method_instance_t *mi, jl_code_info_t *src)
 {
+    // `src->edges` may also be a Vector{Any}; record it as the svec that backedges are
+    // registered from and that invalidation matches against
     jl_svec_t *edges = jl_emptysvec;
-    if (src->edges && jl_is_svec(src->edges))
+    JL_GC_PUSH1(&edges);
+    if (src->edges && jl_is_svec(src->edges)) {
         edges = (jl_svec_t*)src->edges;
+    }
+    else if (src->edges && jl_is_array(src->edges)) {
+        jl_array_t *a = (jl_array_t*)src->edges;
+        size_t n = jl_array_nrows(a);
+        edges = jl_alloc_svec(n);
+        for (size_t i = 0; i < n; i++)
+            jl_svecset(edges, i, jl_array_ptr_ref(a, i));
+    }
 
     // Do not compress this, we expect it to be shortlived.
     jl_code_instance_t *ci = jl_new_codeinst(mi, (jl_value_t*)jl_uninferred_sym,
         (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type, jl_nothing,
         (jl_value_t*)src, 0, src->min_world, src->max_world,
         0, NULL, NULL, edges);
+    JL_GC_POP();
     return ci;
 }
 

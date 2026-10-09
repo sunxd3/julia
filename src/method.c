@@ -801,6 +801,7 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
     int last_lineno = jl_atomic_load_relaxed(&jl_lineno);
     int last_in = ct->ptls->in_pure_callback;
     size_t last_age = ct->world_age;
+    size_t validated_world = jl_atomic_load_acquire(&jl_world_counter);
 
     JL_TRY {
         ct->ptls->in_pure_callback = 1;
@@ -843,6 +844,9 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
             }
         }
 
+        if (func->edges != jl_nothing && !jl_is_svec(func->edges) && !jl_is_array_any(func->edges)) {
+            jl_error("Generated function result `edges` must be `nothing`, a `SimpleVector` or a `Vector{Any}`");
+        }
         if ((func->edges == jl_nothing || func->edges == (jl_value_t*)jl_emptysvec) && func->max_world == ~(size_t)0) {
             if (func->min_world != 1) {
                 jl_error("Generated function result with `edges == nothing` and `max_world == typemax(UInt)` must have `min_world == 1`");
@@ -854,41 +858,47 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
             // since enabling `needs_cache_for_correctness` is unsound in the presence of cache files
             uninferred = (jl_code_info_t*)jl_copy_ast((jl_value_t*)func);
             ci = jl_new_codeinst_for_uninferred(mi, uninferred);
+            // As `finish!` does on the julia side: a body with edges is published only
+            // after its backedges are registered, and only as valid for every world once
+            // the world counter is known not to have moved since before the generator ran.
+            // N.B.: The decoding needs to match `ForwardToBackedgeIterator` on the julia side.
+            jl_svec_t *edges = jl_atomic_load_relaxed(&ci->edges);
+            size_t l = jl_svec_len(edges);
+            int provisional = l > 0 && jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0;
+            if (provisional)
+                jl_atomic_store_relaxed(&ci->max_world, validated_world);
+            for (size_t i = 0; i < l; ) {
+                ex = jl_svecref(edges, i++);
+                if (jl_typetagis(ex, jl_possibly_ambiguous_type))
+                    continue; // marks the edge that follows
+                if (jl_is_long(ex)) {
+                    i++; // `nmatches, atype`: the matches follow as plain edges
+                    continue;
+                }
+                kind = jl_nothing; // the invokesig of an `invokesig, callee` pair
+                if (!jl_is_method(ex) && !jl_is_method_instance(ex) && !jl_is_code_instance(ex) && !jl_is_binding(ex)) {
+                    kind = ex;
+                    if (i == l)
+                        jl_error("Generated function result has an invoke signature without a callee in `edges`");
+                    ex = jl_svecref(edges, i++);
+                }
+                if (jl_is_code_instance(ex))
+                    ex = (jl_value_t*)jl_get_ci_mi((jl_code_instance_t*)ex);
+                if (jl_is_method_instance(ex))
+                    jl_method_instance_add_backedge((jl_method_instance_t*)ex, kind, ci);
+                else if (jl_is_binding(ex))
+                    jl_add_binding_backedge((jl_binding_t*)ex, (jl_value_t*)ci);
+                else if (jl_is_mtable(ex))
+                    jl_method_table_add_backedge(kind, ci);
+                // else a `Method` (e.g. from a failed `abstract_call_method`): not a backedge
+            }
             jl_code_instance_t *cached_ci = jl_cache_uninferred(mi, cache_ci, world, ci);
             if (cached_ci != ci) {
                 func = (jl_code_info_t*)jl_copy_ast(jl_atomic_load_relaxed(&cached_ci->inferred));
                 assert(jl_is_code_info(func));
             }
-            else if (uninferred->edges != jl_nothing) {
-                // N.B.: This needs to match `store_backedges` on the julia side
-                jl_value_t *edges = uninferred->edges;
-                size_t l;
-                jl_value_t **data;
-                if (jl_is_svec(edges)) {
-                    l = jl_svec_len(edges);
-                    data = jl_svec_data(edges);
-                }
-                else {
-                    l = jl_array_dim0(edges);
-                    data = jl_array_data(edges, jl_value_t*);
-                }
-                for (size_t i = 0; i < l; ) {
-                    kind = data[i++];
-                    if (jl_is_method_instance(kind)) {
-                        jl_method_instance_add_backedge((jl_method_instance_t*)kind, jl_nothing, ci);
-                    }
-                    else if (jl_is_binding(kind)) {
-                        jl_add_binding_backedge((jl_binding_t*)kind, (jl_value_t*)ci);
-                    }
-                    else {
-                        assert(i < l);
-                        ex = data[i++];
-                        if (jl_is_mtable(ex)) // abstract dispatch (`invokesig, mt`)
-                            jl_method_table_add_backedge(kind, ci);
-                        else
-                            jl_method_instance_add_backedge((jl_method_instance_t*)ex, kind, ci);
-                    }
-                }
+            else if (provisional) {
+                jl_promote_ci_to_current(ci, validated_world);
             }
             if (cache)
                 *cache = cached_ci;
