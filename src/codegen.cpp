@@ -1053,8 +1053,8 @@ static const auto jlinvokeoc_func = new JuliaFunction<>{
     get_func2_sig,
     get_func_attrs,
 };
-static const auto jlinvoketarget_func = new JuliaFunction<>{
-    XSTR(jl_invoke_target),
+static const auto jlinvokecodeinst_func = new JuliaFunction<>{
+    XSTR(jl_invoke_codeinst),
     get_func2_sig,
     get_func_attrs,
 };
@@ -2228,6 +2228,7 @@ public:
     jl_noaliascache_t aliasscope_cache;
     jl_aliascache_t alias_cache;
     jl_method_instance_t *linfo = NULL;
+    jl_value_t *owner = jl_nothing; // of the CodeInstance being emitted
     jl_value_t *rettype = NULL;
     jl_code_info_t *source = NULL;
     jl_array_t *code = NULL;
@@ -6445,7 +6446,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
             return jl_cgval_t();
         }
         assert(jl_is_method_instance(mi));
-        if (mi == ctx.linfo) {
+        if (mi == ctx.linfo && (!ci || jl_egal(((jl_code_instance_t*)ci)->owner, ctx.owner))) {
             // handle self-recursion specially (TODO: assuming ci is a valid invoke for mi?)
             Function *f = ctx.f;
             FunctionType *ft = f->getFunctionType();
@@ -6477,10 +6478,11 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                     bool specsig, needsparams;
                     std::tie(specsig, needsparams) = uses_specsig(get_ci_abi(codeinst), mi, codeinst->rettype, ctx.params->prefer_specsig);
                     if (needsparams) {
-                        // `jl_invoke` dispatches natively, so a foreign CI must be called through itself
-                        Value *r = codeinst->owner != jl_nothing
-                            ? emit_jlcall(ctx, jlinvoketarget_func, track_pjlvalue(ctx, literal_pointer_val(ctx, ci)), argv, nargs, julia_call2)
-                            : emit_jlcall(ctx, jlinvoke_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
+                        Value *r;
+                        if (jl_is_native_ci_owner(codeinst->owner))
+                            r = emit_jlcall(ctx, jlinvoke_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
+                        else // not interchangeable with the native code for `mi`
+                            r = emit_jlcall(ctx, jlinvokecodeinst_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)codeinst)), argv, nargs, julia_call2);
                         result = mark_julia_type(ctx, r, true, rt);
                     }
                     else {
@@ -8085,10 +8087,9 @@ static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Value *theFunc, j
     if (theFunc) {
         theFarg = literal_pointer_val(ctx, (jl_value_t*)codeinst);
     }
-    else if (codeinst->owner != jl_nothing) {
-        // `jl_invoke` would run the native specialization; a foreign CI must be
-        // compiled by its owner, otherwise `jl_invoke_target` errors
-        theFunc = prepare_call(jlinvoketarget_func);
+    else if (!jl_is_native_ci_owner(codeinst->owner)) {
+        // not interchangeable with the native code for its MethodInstance
+        theFunc = prepare_call(jlinvokecodeinst_func);
         theFarg = literal_pointer_val(ctx, (jl_value_t*)codeinst);
     }
     else {
@@ -9461,6 +9462,8 @@ static jl_llvm_functions_t
 
     ctx.module = jl_is_method(lam->def.method) ? lam->def.method->module : lam->def.module;
     ctx.linfo = lam;
+    if (codeinst)
+        ctx.owner = codeinst->owner;
     ctx.name = name_from_method_instance(lam);
     size_t nreq = src->nargs;
     int va = src->isva;
@@ -11484,7 +11487,7 @@ static void init_jit_functions(void)
     add_named_global(jlapplygeneric_func, &jl_apply_generic);
     add_named_global(jlinvoke_func, &jl_invoke);
     add_named_global(jlinvokemodify_func, &jl_invoke_modify);
-    add_named_global(jlinvoketarget_func, &jl_invoke_target);
+    add_named_global(jlinvokecodeinst_func, &jl_invoke_codeinst);
     add_named_global(jltopeval_func, &jl_toplevel_eval);
     add_named_global(jlcopyast_func, &jl_copy_ast);
     //add_named_global(jlnsvec_func, &jl_svec);
