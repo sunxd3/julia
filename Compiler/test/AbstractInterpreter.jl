@@ -1047,3 +1047,37 @@ gft_egal_pong(n::Int) = n <= 0 ? 0 : gft_overdub_egal(gft_egal_ping, n - 1) + 1
 gft_gen_count[] = 0
 @test gft_overdub_egal(gft_egal_ping, 4) == 4
 @test gft_gen_count[] == 3
+# A method defined while the generator runs, after it looked the call up and inferred it,
+# misses the caller's code in its invalidation pass, since the caller has not recorded its
+# backedges yet. The body handed to the caller's inference is therefore valid at most up to
+# the world the generator started in, and the call regenerates in the next world.
+@newinterp GFTRaceInterp
+const gft_race_codegen = IdDict{CodeInstance,CodeInfo}()
+const gft_race_armed = Ref(false)
+function gft_race_promoted() # the transformed callee is final, valid for every world
+    mi = Base.method_instance(gft_race_target, (Int,))
+    isdefined(mi, :cache) || return false
+    ci = mi.cache
+    while !(ci.owner === GFTRaceInterp && ci.max_world == typemax(UInt))
+        isdefined(ci, :next) || return false
+        ci = ci.next
+    end
+    return true
+end
+function Compiler.codegen_cache(::GFTRaceInterp)
+    if gft_race_armed[] && gft_race_promoted()
+        gft_race_armed[] = false
+        Core.eval(@__MODULE__, :(gft_race_target(x::Int) = x * 7))
+    end
+    return gft_race_codegen
+end
+@eval function gft_race_overdub(f, args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTRaceInterp(; world))))
+end
+gft_race_target(x::Int) = x * 3
+gft_race_armed[] = true
+@test gft_race_overdub(gft_race_target, 2) == 6 # in the world it was called in
+@test !gft_race_armed[]
+@test gft_race_target(2) == 14
+@test gft_race_overdub(gft_race_target, 2) == 14

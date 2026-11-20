@@ -767,10 +767,24 @@ JL_DLLEXPORT jl_code_instance_t *jl_cache_uninferred(jl_method_instance_t *mi JL
     return newci;
 }
 
+// Set the worlds of `src`, a copy owned by the caller of `jl_code_for_staged`. As long as
+// it has edges, it is valid at most up to `validated_world` (see there).
+static void set_staged_worlds(jl_code_info_t *src, size_t min_world, size_t max_world, int has_edges, size_t validated_world) JL_NOTSAFEPOINT
+{
+    src->min_world = min_world;
+    src->max_world = has_edges && max_world > validated_world ? validated_world : max_world;
+}
+
 // Return a newly allocated CodeInfo for the function signature
 // effectively described by the tuple (specTypes, env, Method) inside linfo
 JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, jl_code_instance_t **cache JL_OUT_ROOTED_BY_ARG(0))
 {
+    // Code with edges, as returned from here, is provisional, like an inference result before
+    // `finish!`: a method defined after this point may invalidate before the caller has
+    // registered the backedges of what it makes from this code. So it is returned valid up to
+    // this world at most, and the caller widens its own result once it has validated it. This
+    // is read before the cache, so that a cached body capped before this world is seen capped.
+    size_t validated_world = jl_atomic_load_acquire(&jl_world_counter);
     jl_code_instance_t *cache_ci = jl_atomic_load_relaxed(&mi->cache);
     jl_code_instance_t *uninferred_ci = jl_cached_uninferred(cache_ci, world);
     if (uninferred_ci) {
@@ -780,7 +794,13 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
         // so it doesn't get confused for inference results.
         jl_code_info_t *src = (jl_code_info_t*)jl_atomic_load_relaxed(&uninferred_ci->inferred);
         assert(jl_is_code_info(src)); // make sure this did not get `nothing` put here
-        return (jl_code_info_t*)jl_copy_ast((jl_value_t*)src);
+        src = (jl_code_info_t*)jl_copy_ast((jl_value_t*)src);
+        set_staged_worlds(src, jl_atomic_load_relaxed(&uninferred_ci->min_world),
+                          jl_atomic_load_relaxed(&uninferred_ci->max_world),
+                          jl_svec_len(jl_atomic_load_relaxed(&uninferred_ci->edges)) > 0, validated_world);
+        if (cache)
+            *cache = uninferred_ci;
+        return src;
     }
 
     JL_TIMING(STAGED_FUNCTION, STAGED_FUNCTION);
@@ -801,7 +821,6 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
     int last_in = ct->ptls->in_pure_callback;
     size_t last_age = ct->world_age;
     uint64_t last_fpctrl = jl_fpctrl_enter_default();
-    size_t validated_world = jl_atomic_load_acquire(&jl_world_counter);
 
     JL_TRY {
         if (jl_typetagis(generator, jl_generated_function_transform_type)) {
@@ -909,11 +928,24 @@ JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *mi JL_PROP
                 func = (jl_code_info_t*)jl_copy_ast(jl_atomic_load_relaxed(&cached_ci->inferred));
                 assert(jl_is_code_info(func));
             }
-            else if (provisional) {
-                jl_promote_ci_to_current(ci, validated_world);
+            else {
+                if (provisional)
+                    jl_promote_ci_to_current(ci, validated_world);
+                func = jl_copy_code_info(func); // the generator may hold on to what it returned
             }
+            set_staged_worlds(func, jl_atomic_load_relaxed(&cached_ci->min_world),
+                              jl_atomic_load_relaxed(&cached_ci->max_world),
+                              jl_svec_len(jl_atomic_load_relaxed(&cached_ci->edges)) > 0, validated_world);
             if (cache)
                 *cache = cached_ci;
+        }
+        else {
+            int has_edges = jl_is_svec(func->edges) ? jl_svec_len(func->edges) > 0 :
+                            jl_is_array(func->edges) && jl_array_nrows((jl_array_t*)func->edges) > 0;
+            if (has_edges && func->max_world > validated_world) {
+                func = jl_copy_code_info(func); // the generator may hold on to what it returned
+                func->max_world = validated_world;
+            }
         }
 
         ct->ptls->in_pure_callback = last_in;

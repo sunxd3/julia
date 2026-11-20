@@ -523,6 +523,43 @@ mixed_callee(x::Int) = x + 2
 @test doit_mixed(1) == 3
 @test mixed_edges_runs[] == 3
 
+# A method defined by another thread while a generator runs, after the generator looked the
+# method table up, misses the caller's code in its invalidation pass, since the caller has
+# not recorded the generator's edges as backedges yet. The caller's code must not be valid
+# in the next world, so that the generator runs again. The generator here is not cached.
+let script = raw"""
+    function q end
+    q(::Int) = 1
+    const READY = Threads.Atomic{Bool}(false)
+    const DONE = Threads.Atomic{Bool}(false)
+    const RUNS = Threads.Atomic{Int}(0)
+    function count_q_gen(world::UInt, source, _...)
+        Threads.atomic_add!(RUNS, 1)
+        sig = Tuple{typeof(q), Any}
+        lo, hi = Ref(typemin(UInt)), Ref(typemax(UInt))
+        n = length(Base._methods_by_ftype(sig, nothing, -1, world, false, lo, hi, Ptr{Int32}(C_NULL)))
+        if !READY[]
+            READY[] = true                      # let the other thread define a method now
+            while !DONE[]; GC.safepoint(); end  # and return only after it did
+        end
+        src = Core.GeneratedFunctionStub(identity, Core.svec(:self, :x), Core.svec())(world, source, n)
+        src.edges = Core.svec(sig, Core.methodtable)
+        src.min_world = lo[]
+        src.max_world = hi[]
+        return src
+    end
+    @eval function count_q(x)
+        $(Expr(:meta, :generated_only))
+        $(Expr(:meta, :generated, count_q_gen))
+    end
+    t = Threads.@spawn (while !READY[]; yield(); end; Core.eval(Main, :(q(::Float64) = 2)); DONE[] = true)
+    r = count_q(1)
+    wait(t)
+    print(r, " ", count_q(1), " ", RUNS[])
+    """
+    @test readchomp(`$(Base.julia_cmd()) --startup-file=no -t 2 -e $script`) == "1 2 2"
+end
+
 # A generator that infers code may reach a generated method whose generator is already
 # running (mutual recursion through the generated method). Inference does not recur on a
 # `MethodInstance` the thread is already inferring, so the request that would close the
