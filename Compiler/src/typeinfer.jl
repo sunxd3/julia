@@ -287,14 +287,12 @@ function finish!(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInstan
     const_flags = 0x0
     ipo_effects = zero(UInt32)
     min_world = src.min_world
-    max_world = src.max_world
-    if max_world >= get_world_counter()
-        max_world = typemax(UInt)
-    end
+    # as for an inferred result: valid up to the current world only, until the backedges
+    # are recorded and `jl_promote_ci_to_current` has checked no method was defined meanwhile
+    validation_world = get_world_counter()
+    max_world = min(src.max_world, validation_world)
     unique_backedges = false
-    if max_world == typemax(UInt)
-        # if we can record all of the backedges in the global reverse-cache,
-        # we can now widen our applicability in the global cache too
+    if max_world == validation_world
         unique_backedges = store_backedges(ci, edges)
     end
     ccall(:jl_fill_codeinst, Cvoid, (Any, Any, Any, Any, Any, Int32, UInt, UInt, UInt32, Any, Float64, Float64, Float64, Any, Any),
@@ -303,6 +301,7 @@ function finish!(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInstan
         @atomic :monotonic ci.flags |= CI_FLAGS_UNIQUE_BACKEDGES
     end
     code_cache(interp)[mi] = ci
+    ccall(:jl_promote_ci_to_current, Cvoid, (Any, UInt), ci, validation_world)
     codegen = codegen_cache(interp)
     if codegen !== nothing
         codegen[ci] = src

@@ -576,3 +576,34 @@ let interp = InvalidationTester()
     @test ci.max_world != typemax(UInt)
     @test ci.max_world <= world
 end
+
+# `finish!` widens the CodeInstance of a method whose inference is disabled to later worlds
+# only after storing its backedges, and only if no method was defined meanwhile. A method
+# defined just before the backedges are stored must leave it capped. The test redefines a
+# method of the compiler to define one there, so it runs in a separate process.
+let script = """
+    const C = Base.Compiler
+    dep(x::Int) = x + 1
+    marked(x::Int) = x + 1
+    const edges = Core.svec(Base.method_instance(dep, (Int,)))
+    const defined = Ref(false)
+    function C.store_backedges(ci::Core.CodeInstance, e::Core.SimpleVector)
+        if e === edges && !defined[]
+            defined[] = true
+            Core.eval(Main, :(dep(x::Int) = x + 10))
+        end
+        return C.store_backedges(ci, e, nothing)
+    end
+    let mi = Base.method_instance(marked, (Int,)), world = Base.get_world_counter()
+        src = only(code_lowered(marked, (Int,)))
+        src.edges = edges
+        src.min_world = world
+        interp = C.NativeInterpreter(world)
+        ci = C.engine_reserve(interp, mi)
+        C.finish!(interp, mi, ci, src)
+        defined[] || error("the backedges were not stored")
+        ci.max_world < Base.get_world_counter() || error("the CodeInstance is valid in the new world")
+    end
+    """
+    @test success(pipeline(`$(Base.julia_cmd()) --startup-file=no -e $script`; stderr))
+end
