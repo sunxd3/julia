@@ -82,25 +82,25 @@ use_const_api(li::CodeInstance) = invoke_api(li) == 2
 
 function get_staged(mi::MethodInstance, world::UInt)
     may_invoke_generator(mi) || return nothing
-    cache_ci = (mi.def::Method).generator isa Core.CachedGenerator ?
-        RefValue{CodeInstance}() : nothing
+    cache = (mi.def::Method).generator isa Core.CachedGenerator
     try
-        return call_get_staged(mi, world, cache_ci)
+        return call_get_staged(mi, world, cache)
     catch # user code might throw errors – ignore them
         return nothing
     end
 end
 
-# enable caching of unoptimized generated code if the generator is `CachedGenerator`
-function call_get_staged(mi::MethodInstance, world::UInt, cache_ci::RefValue{CodeInstance})
-    token = @_gc_preserve_begin cache_ci
-    cache_ci_ptr = pointer_from_objref(cache_ci)
-    src = ccall(:jl_code_for_staged, Ref{CodeInfo}, (Any, UInt, Ptr{CodeInstance}), mi, world, cache_ci_ptr)
+# `cache` enables caching of unoptimized generated code, for a `CachedGenerator`.
+# `jl_code_for_staged` takes that request as a slot in which it also returns the
+# CodeInstance holding the code. That is not needed here, and C stores into the slot
+# without a write barrier, so the slot is one the GC does not manage.
+function call_get_staged(mi::MethodInstance, world::UInt, cache::Bool)
+    cache || return ccall(:jl_code_for_staged, Ref{CodeInfo}, (Any, UInt, Ptr{Cvoid}), mi, world, C_NULL)
+    slot = RefValue{Ptr{Cvoid}}(C_NULL)
+    token = @_gc_preserve_begin slot
+    src = ccall(:jl_code_for_staged, Ref{CodeInfo}, (Any, UInt, Ptr{Ptr{Cvoid}}), mi, world, pointer_from_objref(slot))
     @_gc_preserve_end token
     return src
-end
-function call_get_staged(mi::MethodInstance, world::UInt, ::Nothing)
-    return ccall(:jl_code_for_staged, Ref{CodeInfo}, (Any, UInt, Ptr{Cvoid}), mi, world, C_NULL)
 end
 
 function get_cached_uninferred(mi::MethodInstance, world::UInt)
