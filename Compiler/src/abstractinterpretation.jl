@@ -2557,14 +2557,18 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
                 end
                 return Future(CallMeta(Bottom, ErrorException, EFFECTS_THROWS, NoCallInfo()))
             end
-            # a foreign CodeInstance throws if its owner has not added code for it to the JIT
-            # (a native one falls back to `jl_invoke` of its MethodInstance)
-            # TODO: When we add curing, we may want to assume this is nothrow
-            if method_or_ci.owner !== nothing
+            effects = decode_effects(method_or_ci.ipo_purity_bits)
+            if !is_native_owner(method_or_ci.owner)
+                # a foreign CodeInstance throws if its owner has not added code for it to the JIT
+                # (a native one falls back to `jl_invoke` of its MethodInstance). That depends on
+                # the owner, not on the arguments, and folding would evaluate the call through
+                # native dispatch instead
+                # TODO: When we add curing, we may want to assume this is nothrow
                 exct_ci = Union{exct_ci, ErrorException}
+                effects = Effects(effects; consistent=ALWAYS_FALSE)
             end
             update_valid_age!(sv, our_world, callee_valid_range)
-            return Future(CallMeta(method_or_ci.rettype, exct_ci, Effects(decode_effects(method_or_ci.ipo_purity_bits), nothrow=(exct_ci===Bottom)),
+            return Future(CallMeta(method_or_ci.rettype, exct_ci, Effects(effects; nothrow=(exct_ci===Bottom)),
                 InvokeCICallInfo(method_or_ci)))
         else
             method = method_or_ci::Method
