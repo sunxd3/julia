@@ -558,6 +558,18 @@ get_inference_world(interp::NativeInterpreter) = interp.world
 get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
 cache_owner(interp::NativeInterpreter) = interp.inf_params.cache_owner
 
+# Whether a CodeInstance with this `owner` was produced by the native compiler, whose
+# `--trim` namespace is `:trim` (re-stamped to `nothing` on serialization).
+is_native_owner(@nospecialize(owner)) = owner === nothing || owner === :trim
+
+# Whether `ci` was produced by a different compiler than `interp`, so that it is not
+# interchangeable with what `code_cache(interp)` holds for its MethodInstance.
+function is_foreign_owned(interp::AbstractInterpreter, ci::CodeInstance)
+    owner = cache_owner(interp)
+    ci.owner === owner && return false
+    return !(is_native_owner(ci.owner) && is_native_owner(owner))
+end
+
 engine_reserve(interp::AbstractInterpreter, mi::MethodInstance) = engine_reserve(mi, cache_owner(interp))
 engine_reserve(mi::MethodInstance, @nospecialize owner) = ccall(:jl_engine_reserve, Any, (Any, Any), mi, owner)::CodeInstance
 # engine_fulfill(::AbstractInterpreter, ci::CodeInstance, src::CodeInfo) = ccall(:jl_engine_fulfill, Cvoid, (Any, Any), ci, src) # currently the same as engine_reject, so just use that one
