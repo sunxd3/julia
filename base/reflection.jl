@@ -353,7 +353,7 @@ end
 # implemented by the `Compiler` module the interpreter belongs to.
 function (g::Core.GeneratedFunctionTransform)(world::UInt, source::Method, @nospecialize args...)
     interp = g.gen(world)
-    return invoke_interp_compiler(interp, :generate_transformed_body, interp, world, source, args)
+    return invoke_interp_compiler(interp, :generated_function_transform_body, interp, world, source, args)
 end
 
 function invoke_mt_compiler(mt, fname::Symbol, args...)

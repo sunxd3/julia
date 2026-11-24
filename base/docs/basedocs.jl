@@ -4317,10 +4317,22 @@ When a specialization `overdub(f, args...)` is needed in a world `world`:
 1. `interp = gen(world)` must return an interpreter that infers in `world`, defines
    `Compiler.codegen_cache`, so that the code it produces can be invoked, and has a
    `Compiler.cache_owner` of its own, so that its code is not taken for native code.
-2. `f(args...)` is looked up in the method table of `interp`, then inferred and
-   optimized with `interp`, producing a `CodeInstance` `ci` owned by
+2. By default, `f(args...)` is looked up in the method table of `interp`, then inferred
+   and optimized with `interp`, giving a `CodeInstance` `ci` owned by
    `Compiler.cache_owner(interp)`.
 3. The body of the specialization is `invoke(f, ci, args...)`.
+
+The body is produced by `Compiler.generate_transformed_body(interp, world, method, genargs)`.
+An interpreter that needs code the default cannot produce, for example code derived from
+`f` that takes other arguments or returns more than `f` does, adds a method to that
+function for its own type. Such a method builds a `CodeInstance` itself, owned by
+`Compiler.cache_owner(interp)` and stored on the specialization of the generated method
+itself, records its edges, and returns a body that `invoke`s it with the method's own
+arguments; the generated method then need not take the function to call first. The code
+is stored there and nowhere else because inference takes all code stored for one
+`MethodInstance` and owner to be the same function. Callers trust the return type,
+exception type and effects such a `CodeInstance` declares. See the documentation of that
+function for what such a method must ensure.
 
 The body is cached like any generated body and regenerated when `ci` is invalidated, for
 example when `f` or a method it calls is redefined. Callers see the return type and
@@ -4341,16 +4353,26 @@ compiles. A generated body depends on `ci` and on nothing else, so:
   get the new one, whether or not `cache_owner` changed with it. To apply a changed
   transformation everywhere, redefine the generated method: that invalidates all of its
   specializations.
-- They run while the thread holds inference's reservation of the generated method, and
-  a reservation belongs to a thread, not to a task. If they switch tasks, for example by
-  waiting for a lock, `Compiler.engine_hasreserved` is also true in any other task that
-  runs on that thread meanwhile. A tool that uses it to detect recursion must not let two
-  of its tasks transform on one thread at once.
+- While the body of a specialization is generated, the thread holds a reservation of
+  that specialization, and a request for the same body on that thread throws instead of
+  generating it again. A reservation belongs to a thread, not to a task: if `gen` or a
+  method of the interpreter switches tasks, for example by waiting for a lock, another
+  task that runs on that thread meanwhile and needs the same body gets that error. A tool
+  must not let two of its tasks transform on one thread at once.
 
-A transformed body may call the generated method again for a callee whose transformed
-body leads back to the first, as with mutually recursive functions. The call that would
-close such a cycle is not transformed at compile time. It is inferred as returning `Any`
-and dispatched at run time, where it uses the completed body.
+Generating a body may lead back to a request for the same body. With the default, the
+transformed body of a callee may call the generated method for a callee whose transformed
+body leads back to the first, as with mutually recursive functions; with a method added
+to `Compiler.generate_transformed_body`, the code derived for a recursive function may
+call the generated method for that function. The call that would close such a cycle is
+not transformed at compile time. It is inferred as returning `Any` and dispatched at run
+time, where it uses the completed body.
+
+Each specialization is generated independently, in the world of the request that finds
+no valid body for it. A tool that derives several functions from one, such as a forward
+and a reverse pass, must carry whatever they have to agree on in the types of the values
+passed between them, so that a value made by code derived earlier never meets code
+derived again in a later world.
 
 Limitations:
 - As for every generator, the arguments' types must be concrete; a caller that does not

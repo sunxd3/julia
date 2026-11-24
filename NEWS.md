@@ -16,7 +16,8 @@ Compiler/Runtime improvements
   methods: instead of returning an expression, it infers and compiles the call with a custom
   `Compiler.AbstractInterpreter` and emits a body that `invoke`s the resulting `CodeInstance`,
   which is cached and invalidated like any other method body and, if the interpreter retains its
-  code, carried by package images ([#XXXXX]).
+  code, carried by package images. An interpreter that needs other code than a compilation of
+  the call adds a method to `Compiler.generate_transformed_body` for its own type ([#XXXXX]).
 * After a sweep, Julia's default garbage collector now lets any thread reuse the free cells of
   pages that still hold live objects, instead of only the thread that allocated the page. This
   reduces the memory footprint of workloads that allocate many small objects on many threads and

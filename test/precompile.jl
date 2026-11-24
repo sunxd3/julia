@@ -2397,6 +2397,88 @@ precompile_test_harness("GeneratedFunctionTransform invoke edge") do load_path
     end
 end
 
+precompile_test_harness("GeneratedFunctionTransform extension") do load_path
+    # An interpreter with its own method of `Compiler.generate_transformed_body` publishes
+    # a CodeInstance it built itself on the specialization of the generated method. A
+    # package image carries that CodeInstance with its native code, the precompiled caller
+    # keeps `:invoke`ing it without regenerating the body, a body generated again after
+    # load uses it, and invalidating one of its edges regenerates the body.
+    newinterp_path = abspath(joinpath(@__DIR__, "../Compiler/test/newinterp.jl"))
+    write(joinpath(load_path, "GFTExtension.jl"),
+        """
+        module GFTExtension
+        import Base.Compiler: Compiler
+        using Core: CodeInstance, CodeInfo
+        include($(repr(newinterp_path)))
+        @newinterp GFTExtensionInterp
+        const CODEGEN = IdDict{CodeInstance,CodeInfo}()
+        Compiler.codegen_cache(::GFTExtensionInterp) = CODEGEN
+        const GEN_CALLS = Ref(0)
+        const PUBLISHED = Ref(0)
+        leaf(x::Float64) = 2x
+        struct Rule end
+        struct RuleImpl end # stands for the code a tool derives
+        (::RuleImpl)(x::Float64) = (leaf(x) + 1.0, 100.0 * x)
+        function Compiler.generate_transformed_body(interp::GFTExtensionInterp, world::UInt, method::Method,
+                                                    @nospecialize(genargs::Tuple))
+            GEN_CALLS[] += 1
+            sig = Tuple{RuleImpl,Float64}
+            match, valid_worlds = Compiler.findsup(sig, Compiler.InternalMethodTable(world))
+            mi = Compiler.specialize_method(method, Tuple{genargs...}, Core.svec())
+            ci = publish_generated_code!(interp, mi) do
+                PUBLISHED[] += 1
+                native = Compiler.NativeInterpreter(world)
+                impl = Compiler.specialize_method(match::Core.MethodMatch)
+                dep = Compiler.typeinf_ext(native, impl, Compiler.SOURCE_MODE_NOT_REQUIRED)::CodeInstance
+                src = Compiler.typeinf_code(native, impl, true)::CodeInfo
+                src.slottypes[1] = Rule
+                src, Core.svec(dep, sig, Core.methodtable, src.edges...)
+            end
+            stub = Core.GeneratedFunctionStub(identity, Core.svec(:rule, :x), Core.svec())
+            body = stub(world, method, Expr(:call, GlobalRef(Core, :invoke), :rule, ci, :x))::CodeInfo
+            body.edges = Core.svec(ci)
+            body.min_world = max(ci.min_world, first(valid_worlds))
+            body.max_world = min(ci.max_world, last(valid_worlds))
+            return body
+        end
+        @eval function (rule::Rule)(x::Float64)
+            \$(Expr(:meta, :generated_only))
+            \$(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTExtensionInterp(; world))))
+        end
+        caller(x::Float64) = Rule()(x)[1] + 0.5
+        precompile(caller, (Float64,))
+        end
+        """)
+    Base.compilecache(Base.PkgId("GFTExtension"))
+    @eval using GFTExtension
+    invokelatest() do
+        M = GFTExtension
+        @test M.GEN_CALLS[] == 1 # generated once while precompiling
+        mi = only(Base.specializations(only(methods(M.Rule()))))
+        ci = check_presence(mi, M.GFTExtensionInterp)
+        @test ci !== nothing
+        @test ci.invoke != C_NULL
+        callerci = check_presence(only(Base.specializations(only(methods(M.caller)))), nothing)
+        @test callerci !== nothing
+        src = callerci.inferred
+        src isa String && (src = Base._uncompressed_ir(callerci, src))
+        @test src isa Core.CodeInfo && any(src.code) do @nospecialize stmt
+            Meta.isexpr(stmt, :invoke) && stmt.args[1] === ci
+        end
+        @test invokelatest(M.caller, 3.0) === 7.5
+        @test M.GEN_CALLS[] == 1 # the precompiled body was used, not regenerated
+        # a new caller may run the generator again; it finds the code the image carries
+        caller2 = Core.eval(M, :(caller2(x::Float64) = Rule()(x)[2]))
+        @test invokelatest(caller2, 3.0) === 300.0
+        @test M.PUBLISHED[] == 1
+        gen_calls = M.GEN_CALLS[]
+        Core.eval(M, :(leaf(x::Float64) = 3x))
+        @test invokelatest(M.caller, 3.0) === 10.5
+        @test M.GEN_CALLS[] == gen_calls + 1
+        @test M.PUBLISHED[] == 2
+    end
+end
+
 precompile_test_harness("DynamicExpressions") do load_path
     # https://github.com/JuliaLang/julia/pull/47184#issuecomment-1364716312
     write(joinpath(load_path, "Float16MWE.jl"),

@@ -1163,3 +1163,217 @@ gft_race_armed[] = true
 @test !gft_race_armed[]
 @test gft_race_target(2) == 14
 @test gft_race_overdub(gft_race_target, 2) == 14
+
+# An interpreter that needs other code than a compilation of the call adds a method to
+# `generate_transformed_body` for its own type. That method publishes a CodeInstance of
+# the interpreter's own on the specialization of the generated method itself, with its
+# dependencies as edges, and returns a body that invokes it. Callers infer the return type
+# of that CodeInstance and `:invoke` exactly it, and redefining a dependency regenerates
+# the body. Other calls fall through to the default.
+@newinterp GFTExtInterp
+const gft_ext_codegen = IdDict{CodeInstance,CodeInfo}()
+Compiler.codegen_cache(::GFTExtInterp) = gft_ext_codegen
+const gft_ext_calls = Ref(0)
+const gft_ext_derivations = Ref(0)
+const gft_ext_published = Ref{CodeInstance}()
+# Optimized code of the call `sig`, as a stand-in for code a tool derives, with what it
+# depends on: its native CodeInstance, the edges of the code, and the lookup that found it.
+function gft_ext_derive(world::UInt, @nospecialize(sig::Type))
+    native = Compiler.NativeInterpreter(world)
+    match, valid_worlds = Compiler.findsup(sig, Compiler.InternalMethodTable(world))
+    mi = Compiler.specialize_method(match::Core.MethodMatch)
+    dep = Compiler.typeinf_ext(native, mi, Compiler.SOURCE_MODE_NOT_REQUIRED)::CodeInstance
+    src = Compiler.typeinf_code(native, mi, true)::CodeInfo
+    return src, Core.svec(dep, sig, Core.methodtable, src.edges...), valid_worlds
+end
+# Code written for the arguments of `mi`, inferred and optimized with `interp`, which
+# records the calls it resolved as edges.
+function gft_ext_infer(interp::GFTExtInterp, mi::MethodInstance, src::CodeInfo)
+    result = Compiler.InferenceResult(mi, Compiler.typeinf_lattice(interp))
+    frame = Compiler.InferenceState(result, src, #=cache_mode=#:no, interp)
+    Compiler.typeinf(interp, frame)
+    @assert Compiler.is_inferred(frame)
+    opt = Compiler.OptimizationState(frame, interp)
+    Compiler.optimize(interp, opt, result)
+    return Compiler.ir_to_codeinf!(opt, frame, Compiler.materialize_inference_edges(opt.inlining.edges))
+end
+gft_ext_stub(world::UInt, method::Method, argnames, body) =
+    Core.GeneratedFunctionStub(identity, Core.svec(argnames...), Core.svec())(world, method, body)::CodeInfo
+function gft_ext_body(world::UInt, method::Method, argnames, ci::CodeInstance, valid_worlds::Compiler.WorldRange)
+    src = gft_ext_stub(world, method, argnames, Expr(:call, GlobalRef(Core, :invoke), argnames[1], ci, argnames[2:end]...))
+    src.edges = Core.svec(ci)
+    src.min_world = max(ci.min_world, first(valid_worlds))
+    src.max_world = min(ci.max_world, last(valid_worlds))
+    return src
+end
+gft_ext_leaf(x::Float64) = 2x
+
+# the rule takes the arguments of its code, and there is no function to call first
+struct GFTExtRule end
+@eval function (rule::GFTExtRule)(x::Float64)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTExtInterp(; world))))
+end
+struct GFTExtRuleImpl end
+(::GFTExtRuleImpl)(x::Float64) = (gft_ext_leaf(x), x)
+
+# the code derived for a recursive function calls the generated method for that function
+@eval function gft_ext_rec(f, x::Float64)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTExtInterp(; world))))
+end
+gft_ext_rec_target(x::Float64) = x <= 0.0 ? 0.0 : gft_ext_rec_target(x - 1.0) + 1.0
+
+# every other call is left to the default
+@eval function gft_ext_overdub(f, args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTExtInterp(; world))))
+end
+
+function Compiler.generate_transformed_body(interp::GFTExtInterp, world::UInt, method::Method, @nospecialize(genargs::Tuple))
+    gft_ext_calls[] += 1
+    if genargs === (GFTExtRule, Float64)
+        impl, deps, valid_worlds = gft_ext_derive(world, Tuple{GFTExtRuleImpl,Float64})
+        mi = Compiler.specialize_method(method, Tuple{genargs...}, Core.svec())
+        ci = publish_generated_code!(interp, mi) do
+            gft_ext_derivations[] += 1
+            impl.slottypes[1] = GFTExtRule
+            impl, deps
+        end
+        gft_ext_published[] = ci
+        return gft_ext_body(world, method, (:rule, :x), ci, valid_worlds)
+    elseif genargs === (typeof(gft_ext_rec), typeof(gft_ext_rec_target), Float64)
+        argnames = (Symbol("#self#"), :f, :x)
+        mi = Compiler.specialize_method(method, Tuple{genargs...}, Core.svec())
+        ci = publish_generated_code!(interp, mi) do
+            gft_ext_derivations[] += 1
+            code = gft_ext_infer(interp, mi, gft_ext_stub(world, method, argnames, quote
+                x <= 0.0 && return (0.0, 0.0)
+                r = $gft_ext_rec(f, x - 1.0)
+                return (r[1] + 1.0, r[2])
+            end))
+            code, code.edges::Core.SimpleVector
+        end
+        gft_ext_published[] = ci
+        return gft_ext_body(world, method, argnames, ci, Compiler.WorldRange(world, typemax(UInt)))
+    end
+    return @invoke Compiler.generate_transformed_body(interp::Compiler.AbstractInterpreter, world::UInt, method::Method, genargs::Tuple)
+end
+gft_ext_owned(mi::MethodInstance) = let n = 0, ci = mi.cache
+    while true
+        n += ci.owner === GFTExtInterp
+        isdefined(ci, :next) || break
+        ci = ci.next
+    end
+    n
+end
+
+gft_ext_rule_caller(x::Float64) = GFTExtRule()(x)[1] + 0.5
+@test GFTExtRule()(3.0) === (6.0, 3.0)
+@test gft_ext_derivations[] == 1
+let ci = gft_ext_published[]
+    @test ci.owner === GFTExtInterp
+    @test ci.def === Base.method_instance(GFTExtRule(), (Float64,))
+    @test ci.max_world == typemax(UInt)
+    @test Base.return_types(GFTExtRule(), (Float64,)) == Any[Tuple{Float64,Float64}]
+    @test Base.return_types(gft_ext_rule_caller, (Float64,)) == Any[Float64]
+    @test count(code_typed1(gft_ext_rule_caller, (Float64,)).code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] === ci
+    end == 1
+end
+@test gft_ext_rule_caller(3.0) === 6.5
+@test gft_ext_derivations[] == 1
+gft_ext_leaf(x::Float64) = 3x
+@test gft_ext_rule_caller(3.0) === 9.5
+@test gft_ext_derivations[] == 2
+(::GFTExtRuleImpl)(x::Float64) = (gft_ext_leaf(x), -x)
+@test GFTExtRule()(3.0) === (9.0, -3.0)
+@test gft_ext_derivations[] == 3
+
+# The request for the body that its own derivation makes is refused, so the code is
+# derived once; the call that made the request is dispatched at run time.
+gft_ext_calls[] = gft_ext_derivations[] = 0
+@test gft_ext_rec(gft_ext_rec_target, 3.0) === (3.0, 0.0)
+@test gft_ext_calls[] == gft_ext_derivations[] == 1
+@test gft_ext_owned(Base.method_instance(gft_ext_rec, (typeof(gft_ext_rec_target), Float64))) == 1
+@test gft_ext_rec(gft_ext_rec_target, 5.0) === (5.0, 0.0)
+@test gft_ext_derivations[] == 1
+
+gft_ext_target(x::Float64) = gft_ext_leaf(x) - 1.0
+gft_ext_calls[] = 0
+@test gft_ext_overdub(gft_ext_target, 3.0) === 8.0
+@test gft_ext_calls[] == 1
+gft_ext_leaf(x::Float64) = 5x
+@test gft_ext_overdub(gft_ext_target, 3.0) === 14.0
+@test gft_ext_calls[] == 2
+
+# What the generator requires of the interpreter and of the method is checked before
+# `generate_transformed_body` is called, so a method added to it cannot skip the checks.
+# What it returns is checked as well: the body may refer to no CodeInstance that is not
+# among its edges, since nothing else would regenerate it once that code is invalid, and
+# may not be valid where one of them is not. It need not invoke anything.
+@newinterp GFTExtBadInterp
+@newinterp GFTExtBadOwnerInterp
+const gft_ext_bad_calls = Ref(0)
+Compiler.codegen_cache(interp::Union{GFTExtBadInterp,GFTExtBadOwnerInterp}) = interp.meta === :nocodegen ? nothing : gft_ext_codegen
+Compiler.cache_owner(::GFTExtBadOwnerInterp) = nothing
+function Compiler.generate_transformed_body(interp::Union{GFTExtBadInterp,GFTExtBadOwnerInterp}, world::UInt, method::Method, @nospecialize(genargs::Tuple))
+    gft_ext_bad_calls[] += 1
+    interp.meta === :notcode && return :(f(x))
+    if interp.meta === :plain
+        src = gft_ext_stub(world, method, (Symbol("#self#"), :f, :x), :(f(x)))
+        src.edges = Core.svec(Tuple{genargs[2:end]...}, Core.methodtable)
+        src.min_world = world
+        return src
+    end
+    src = @invoke Compiler.generate_transformed_body(GFTExtInterp(; world)::Compiler.AbstractInterpreter, world::UInt, method::Method, genargs::Tuple)
+    if interp.meta === :worlds
+        src.max_world = typemax(UInt)
+        src.edges = Core.svec(src.edges..., gft_ext_stale)
+    elseif interp.meta === :unlisted
+        src.edges = Core.svec(gft_ext_listed)
+        src.min_world = max(src.min_world, gft_ext_listed.min_world)
+    end
+    return src
+end
+for (name, gen) in ((:gft_ext_bad_codegen, (world::UInt) -> GFTExtBadInterp(:nocodegen; world)),
+                    (:gft_ext_bad_owner, (world::UInt) -> GFTExtBadOwnerInterp(; world)),
+                    (:gft_ext_bad_world, (world::UInt) -> GFTExtBadInterp(; world = world - 1)),
+                    (:gft_ext_bad_result, (world::UInt) -> GFTExtBadInterp(:notcode; world)),
+                    (:gft_ext_bad_edge, (world::UInt) -> GFTExtBadInterp(:unlisted; world)),
+                    (:gft_ext_bad_range, (world::UInt) -> GFTExtBadInterp(:worlds; world)),
+                    (:gft_ext_plain, (world::UInt) -> GFTExtBadInterp(:plain; world)))
+    @eval function $name(f, x)
+        $(Expr(:meta, :generated_only))
+        $(Expr(:meta, :generated, Core.GeneratedFunctionTransform(gen)))
+    end
+end
+@eval function gft_ext_bad_kw(f, x; k = 1)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTExtBadInterp(; world))))
+end
+@test_throws "must define a `Compiler.codegen_cache`" gft_ext_bad_codegen(gft_ext_target, 3.0)
+@test_throws "must define a `Compiler.cache_owner`" gft_ext_bad_owner(gft_ext_target, 3.0)
+@test_throws "returned an interpreter for world" gft_ext_bad_world(gft_ext_target, 3.0)
+@test_throws "keyword arguments are not supported" gft_ext_bad_kw(gft_ext_target, 3.0)
+@test gft_ext_bad_calls[] == 0
+@test_throws "must return a `CodeInfo`" gft_ext_bad_result(gft_ext_target, 3.0)
+gft_ext_stale_leaf(x::Float64) = x
+@noinline gft_ext_stale_target(x::Float64) = gft_ext_stale_leaf(x)
+@noinline gft_ext_listed_target(x::Float64) = x
+gft_ext_stale, gft_ext_listed = let world = Base.get_world_counter()
+    map((gft_ext_stale_target, gft_ext_listed_target)) do f
+        Compiler.typeinf_ext_toplevel(GFTExtBadInterp(; world), Base.method_instance(f, (Float64,); world), Compiler.SOURCE_MODE_ABI)::CodeInstance
+    end
+end
+# the body invokes one CodeInstance and has another as its edge
+@test_throws "refers to a `CodeInstance` that is not in its `edges`" gft_ext_bad_edge(gft_ext_target, 3.0)
+# the body is valid in worlds in which code it depends on is not
+gft_ext_stale_leaf(x::Float64) = -x
+@test gft_ext_stale.max_world < Base.get_world_counter()
+@test_throws "an edge of it, is not" gft_ext_bad_range(gft_ext_target, 3.0)
+@test gft_ext_bad_calls[] > 0
+# a body that is an ordinary call, with the lookup as its edge
+@test gft_ext_plain(gft_ext_target, 3.0) === 14.0
+gft_ext_target(x::Float64) = gft_ext_leaf(x) - 2.0
+@test gft_ext_plain(gft_ext_target, 3.0) === 13.0

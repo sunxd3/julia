@@ -62,3 +62,42 @@ macro newinterp(InterpName, ephemeral_cache::Bool=false)
         end)
     end
 end
+
+"""
+    publish_generated_code!(derive, interp, mi::MethodInstance) -> CodeInstance
+
+A reference for how a method of `Compiler.generate_transformed_body` publishes the code
+it built itself for `mi`, the specialization of the generated method, in the cache of
+`interp`, and makes it ready to `invoke`.
+
+Code of `mi` that the cache already holds and that is valid in the world of `interp` is
+used as it is. Otherwise `derive()` is called for `(src, edges)`: optimized code for the
+arguments of `mi`, with its return type in `src.rettype`, and everything in the world it
+depends on. As `finish!` does for an inferred result, the code is published as valid in
+the interpreter's world only, and for later worlds once its backedges are stored and the
+world counter is known not to have moved since before `derive` was called.
+
+This does not reserve `mi` in the inference engine, so two threads may publish at once.
+"""
+function publish_generated_code!(derive, interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance)
+    world = Compiler.get_inference_world(interp)
+    validation_world = Base.get_world_counter()
+    ci = Compiler.find_typeinf_cached_ci(interp, mi, Compiler.WorldRange(world), Compiler.SOURCE_MODE_ABI)
+    if ci === nothing
+        src, edges = derive()
+        src::Core.CodeInfo
+        edges::Core.SimpleVector
+        src.edges = edges
+        src.min_world = src.max_world = world
+        inferred = Compiler.maybe_compress_codeinfo(interp, mi, src)
+        ci = Core.CodeInstance(mi, Compiler.cache_owner(interp), src.rettype, Any, nothing, inferred, Int32(0),
+            world, world, Compiler.encode_effects(Compiler.EFFECTS_UNKNOWN), nothing, src.debuginfo, edges)
+        if world == validation_world && Compiler.store_backedges(ci, edges)
+            @atomic :monotonic ci.flags |= Compiler.CI_FLAGS_UNIQUE_BACKEDGES
+        end
+        Compiler.codegen_cache(interp)[ci] = src
+        Compiler.code_cache(interp)[mi] = ci
+        ccall(:jl_promote_ci_to_current, Cvoid, (Any, UInt), ci, validation_world)
+    end
+    return Compiler.add_codeinsts_to_jit!(interp, ci, Compiler.SOURCE_MODE_ABI)::Core.CodeInstance
+end

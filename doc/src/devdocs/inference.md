@@ -131,14 +131,21 @@ The pieces involved:
   `primary_world` as pure callbacks, which would keep the inner inference from seeing
   the world counter it must cap its results at.
 - The call method in `base/reflection.jl` constructs `interp = gen(world)` and forwards
-  to `generate_transformed_body` (`Compiler/src/generated_function_transform.jl`) of the
-  `Compiler` module `interp` belongs to, so an interpreter written against a separately
-  loaded `Compiler` is served by that module.
-- `generate_transformed_body` runs `typeinf_ext_toplevel` on the looked-up
-  `MethodInstance` and returns the stub with the resulting `CodeInstance` as its edge,
-  its world range bounded by that instance and by the lookup. As a `CachedGenerator`,
-  the stub is cached on the generated method's `MethodInstance` and registered as a
-  backedge of the inner `MethodInstance`.
+  to `generated_function_transform_body` (`Compiler/src/generated_function_transform.jl`)
+  of the `Compiler` module `interp` belongs to, so an interpreter written against a
+  separately loaded `Compiler` is served by that module. That function checks the
+  interpreter and the method, reserves the specialization in the inference engine under
+  a key of its own, so that a request for the same body on the same thread throws
+  instead of recurring and other threads wait, calls `generate_transformed_body`, and
+  checks the world range and the edges of the body it returns.
+- `generate_transformed_body` is the extension point. Its default method runs
+  `typeinf_ext_toplevel` on the looked-up `MethodInstance` and returns the stub with the
+  resulting `CodeInstance` as its edge, its world range bounded by that instance and by
+  the lookup. An interpreter that needs other code adds a method for its own type, which
+  publishes a `CodeInstance` of its own on the generated method's own `MethodInstance`
+  and returns a body that invokes it (see below).
+- As a `CachedGenerator`, the stub is cached on the generated method's `MethodInstance`
+  and registered as a backedge of the inner `MethodInstance`.
 - In a caller, inference resolves `invoke` with a constant `CodeInstance` to
   `InvokeCICallInfo` (`abstract_invoke`), and inlining (`handle_invoke_call!`) turns
   the call into an `:invoke` of exactly that `CodeInstance`, never another compilation
@@ -146,3 +153,9 @@ The pieces involved:
 - `typeinf_ext` does not recur on a `MethodInstance` this thread is already inferring
   (`jl_engine_hasreserved`, as `jl_type_infer` does), which bounds recursion through the
   generated method.
+
+The contract of the extension point:
+
+```@docs
+Base.Compiler.generate_transformed_body
+```
