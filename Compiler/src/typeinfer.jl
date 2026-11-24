@@ -194,13 +194,10 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         time_self_ns = caller.time_self_ns + (time_now - time_before)
         time_before = time_now
         time_total = (time_now - caller.time_start - caller.time_paused) * 1e-9
-        ccall(:jl_fill_codeinst, Cvoid, (Any, Any, Any, Any, Any, Int32, UInt, UInt, UInt32, Any, Float64, Float64, Float64, Any, Any),
-            ci, widenconst_split(result_type), widenconst_split(result.exc_result), rettype_const, inferred_result,
+        fill_codeinst!(ci, widenconst_split(result_type), widenconst_split(result.exc_result), rettype_const, inferred_result,
             const_flags, min_world, max_world,
-            ipo_effects, result.analysis_results, time_total, caller.time_caches, time_self_ns * 1e-9, debuginfo, edges)
-        if unique_backedges
-            @atomic :monotonic ci.flags |= CI_FLAGS_UNIQUE_BACKEDGES
-        end
+            ipo_effects, result.analysis_results, time_total, caller.time_caches, time_self_ns * 1e-9, debuginfo, edges,
+            unique_backedges)
     elseif caller.cache_mode === CACHE_MODE_LOCAL
         result.src = transform_result_for_local_cache(interp, result)
     end
@@ -278,28 +275,40 @@ function promotecache!(interp::AbstractInterpreter, caller::InferenceState)
     nothing
 end
 
-function finish!(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInstance, src::CodeInfo)
-    user_edges = src.edges
-    edges = user_edges isa SimpleVector ? user_edges : user_edges === nothing ? Core.svec() : Core.svec(user_edges...)
-    di = src.debuginfo
-    rettype = Any
-    exctype = Any
-    const_flags = 0x0
-    ipo_effects = zero(UInt32)
+# Fill `ci`, the placeholder of a reservation, with a finished result whose backedges have
+# been stored (`unique_backedges` is what `store_backedges` returned, or `false`).
+function fill_codeinst!(ci::CodeInstance, @nospecialize(rettype), @nospecialize(exctype), @nospecialize(rettype_const),
+                        @nospecialize(inferred), const_flags::UInt8, min_world::UInt, max_world::UInt, ipo_effects::UInt32,
+                        @nospecialize(analysis_results), time_total::Float64, time_caches::Float64, time_self::Float64,
+                        debuginfo::DebugInfo, edges::SimpleVector, unique_backedges::Bool)
+    ccall(:jl_fill_codeinst, Cvoid, (Any, Any, Any, Any, Any, Int32, UInt, UInt, UInt32, Any, Float64, Float64, Float64, Any, Any),
+        ci, rettype, exctype, rettype_const, inferred,
+        const_flags, min_world, max_world,
+        ipo_effects, analysis_results, time_total, time_caches, time_self, debuginfo, edges)
+    if unique_backedges
+        @atomic :monotonic ci.flags |= CI_FLAGS_UNIQUE_BACKEDGES
+    end
+    return nothing
+end
+
+# Publish `src`, code that did not come out of an `InferenceState`, as the result `ci`
+# that this thread reserved for `mi`: fill it, put it in the cache and the codegen cache of
+# `interp`, and release the reservation. The result is valid in the worlds of `src` up to
+# `validation_world`, the world counter as read before `src` and `edges` were made, and
+# in later worlds too once its backedges are stored and no method was defined meanwhile.
+function publish_codeinst!(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInstance, src::CodeInfo,
+                           @nospecialize(rettype), @nospecialize(exctype), @nospecialize(inferred), ipo_effects::UInt32,
+                           @nospecialize(analysis_results), edges::SimpleVector, validation_world::UInt)
     min_world = src.min_world
     # as for an inferred result: valid up to the current world only, until the backedges
     # are recorded and `jl_promote_ci_to_current` has checked no method was defined meanwhile
-    validation_world = get_world_counter()
     max_world = min(src.max_world, validation_world)
     unique_backedges = false
     if max_world == validation_world
         unique_backedges = store_backedges(ci, edges)
     end
-    ccall(:jl_fill_codeinst, Cvoid, (Any, Any, Any, Any, Any, Int32, UInt, UInt, UInt32, Any, Float64, Float64, Float64, Any, Any),
-        ci, rettype, exctype, nothing, nothing, const_flags, min_world, max_world, ipo_effects, nothing, 0.0, 0.0, 0.0, di, edges)
-    if unique_backedges
-        @atomic :monotonic ci.flags |= CI_FLAGS_UNIQUE_BACKEDGES
-    end
+    fill_codeinst!(ci, rettype, exctype, nothing, inferred, 0x0, min_world, max_world, ipo_effects,
+        analysis_results, 0.0, 0.0, 0.0, src.debuginfo, edges, unique_backedges)
     code_cache(interp)[mi] = ci
     ccall(:jl_promote_ci_to_current, Cvoid, (Any, UInt), ci, validation_world)
     codegen = codegen_cache(interp)
@@ -308,6 +317,12 @@ function finish!(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInstan
     end
     engine_reject(interp, ci)
     return nothing
+end
+
+function finish!(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInstance, src::CodeInfo)
+    user_edges = src.edges
+    edges = user_edges isa SimpleVector ? user_edges : user_edges === nothing ? Core.svec() : Core.svec(user_edges...)
+    return publish_codeinst!(interp, mi, ci, src, Any, Any, nothing, zero(UInt32), nothing, edges, get_world_counter())
 end
 
 function finish_nocycle(interp::AbstractInterpreter, frame::InferenceState{I}, time_before::UInt64) where {I<:AbstractInterpreter}

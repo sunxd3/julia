@@ -1377,3 +1377,100 @@ gft_ext_stale_leaf(x::Float64) = -x
 @test gft_ext_plain(gft_ext_target, 3.0) === 14.0
 gft_ext_target(x::Float64) = gft_ext_leaf(x) - 2.0
 @test gft_ext_plain(gft_ext_target, 3.0) === 13.0
+
+# A method of `generate_transformed_body` may instead return typed IR for the
+# specialization, with the edges only it knows. The compiler types the statements left to
+# it, optimizes the IR, and publishes it as the interpreter's code of the specialization
+# with the return type and effects it finds, the edges it recorded and the declared ones;
+# the body invokes that code. Code published before that is still valid is used without
+# deriving it again.
+@newinterp GFTIRInterp
+const gft_ir_codegen = IdDict{CodeInstance,CodeInfo}()
+Compiler.codegen_cache(::GFTIRInterp) = gft_ir_codegen
+const gft_ir_derivations = Ref(0)
+struct GFTIRRule end
+@eval function (rule::GFTIRRule)(x::Float64, y::Float64)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, Core.GeneratedFunctionTransform((world::UInt) -> GFTIRInterp(; world))))
+end
+gft_ir_leaf(x::Float64) = 2x
+@noinline gft_ir_callee(x::Float64) = x + 1.0
+gft_ir_source(x::Float64, y::Float64) = gft_ir_leaf(x) + y
+gft_ir_extra(x::Float64) = (x, gft_ir_callee(x))
+function Compiler.generate_transformed_body(interp::GFTIRInterp, world::UInt, method::Method, @nospecialize(genargs::Tuple))
+    gft_ir_derivations[] += 1
+    interp.meta === :notir && return (1, Core.svec())
+    native = Compiler.NativeInterpreter(world)
+    sig = Tuple{typeof(gft_ir_source),Float64,Float64}
+    match, valid_worlds = Compiler.findsup(sig, Compiler.InternalMethodTable(world))
+    mi = Compiler.specialize_method(match::Core.MethodMatch)
+    dep = Compiler.typeinf_ext(native, mi, Compiler.SOURCE_MODE_NOT_REQUIRED)::CodeInstance
+    ir = Compiler.typeinf_ircode(native, mi, nothing)[1]::Compiler.IRCode
+    # the code of the source, for the arguments of the rule, with one more call applied
+    # to what it returns: the type of that call is left to the compiler
+    ir.argtypes[1] = GFTIRRule
+    interp.meta === :arity && pop!(ir.argtypes)
+    idx = findfirst(stmt -> stmt isa Core.ReturnNode, ir.stmts.stmt)::Int
+    call = Compiler.insert_node!(ir, Core.SSAValue(idx), Compiler.NewInstruction(
+        Expr(:call, gft_ir_extra, ir[Core.SSAValue(idx)][:stmt].val), Any, Compiler.NoCallInfo(), nothing, Compiler.IR_FLAG_REFINED))
+    ir[Core.SSAValue(idx)][:stmt] = Core.ReturnNode(call)
+    return Compiler.IRCode(ir, valid_worlds), Core.svec(dep, sig, Core.methodtable)
+end
+gft_ir_code(world::UInt = Base.get_world_counter()) = Compiler.find_typeinf_cached_ci(GFTIRInterp(; world),
+    Base.method_instance(GFTIRRule(), (Float64, Float64); world), Compiler.WorldRange(world), Compiler.SOURCE_MODE_ABI)
+gft_ir_caller(x::Float64) = GFTIRRule()(x, 1.0)[2] + 0.5
+@test GFTIRRule()(3.0, 1.0) === (7.0, 8.0)
+@test gft_ir_derivations[] == 1
+let ci = gft_ir_code()::CodeInstance
+    @test ci.owner === GFTIRInterp
+    @test ci.max_world == typemax(UInt)
+    @test ci.rettype === Tuple{Float64,Float64}
+    effects = Compiler.decode_effects(ci.ipo_purity_bits)
+    @test Compiler.is_effect_free(effects) && Compiler.is_nothrow(effects) && Compiler.is_consistent(effects)
+    @test ci.exctype === Union{}
+    # the call the tool added is inlined, and the call left in it is resolved to the code
+    # the interpreter has for it
+    src = gft_ir_codegen[ci]
+    @test all(src.code) do @nospecialize stmt
+        !isexpr(stmt, :call) || Compiler.singleton_type(Compiler.argextype(stmt.args[1], src, Compiler.VarState[])) isa Union{Core.Builtin,Core.IntrinsicFunction}
+    end
+    @test count(src.code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] isa CodeInstance && stmt.args[1].owner === GFTIRInterp &&
+            Compiler.get_ci_mi(stmt.args[1]).def === only(methods(gft_ir_callee))
+    end == 1
+    @test Base.return_types(GFTIRRule(), (Float64, Float64)) == Any[Tuple{Float64,Float64}]
+    @test Base.return_types(gft_ir_caller, (Float64,)) == Any[Float64]
+    @test Compiler.is_effect_free(Base.infer_effects(gft_ir_caller, (Float64,)))
+    @test count(code_typed1(gft_ir_caller, (Float64,)).code) do @nospecialize stmt
+        isexpr(stmt, :invoke) && stmt.args[1] === ci
+    end == 1
+    # a body that is generated again finds the code and invokes it
+    world = Base.get_world_counter()
+    method = only(methods(GFTIRRule()))
+    body = Compiler.generated_function_transform_body(GFTIRInterp(; world), world, method, (GFTIRRule, Float64, Float64))
+    @test body.edges == Core.svec(ci)
+    @test gft_ir_derivations[] == 1
+end
+@test gft_ir_caller(3.0) === 8.5
+@test gft_ir_derivations[] == 1
+# a declared edge: the code the IR was taken from
+gft_ir_leaf(x::Float64) = 3x
+@test gft_ir_caller(3.0) === 11.5
+@test gft_ir_derivations[] == 2
+# edges recorded while typing: the method the added call resolves to, and one it calls
+gft_ir_extra(x::Float64) = (x, gft_ir_callee(x) + 1.0)
+@test gft_ir_caller(3.0) === 12.5
+@test gft_ir_derivations[] == 3
+@noinline gft_ir_callee(x::Float64) = x + 10.0
+@test GFTIRRule()(3.0, 1.0) === (10.0, 21.0)
+@test gft_ir_derivations[] == 4
+# the IR must be that of the specialization
+for (name, gen) in ((:gft_ir_bad_arity, (world::UInt) -> GFTIRInterp(:arity; world)),
+                    (:gft_ir_bad_result, (world::UInt) -> GFTIRInterp(:notir; world)))
+    @eval function $name(x::Float64, y::Float64)
+        $(Expr(:meta, :generated_only))
+        $(Expr(:meta, :generated, Core.GeneratedFunctionTransform(gen)))
+    end
+end
+@test_throws "takes 2 arguments" gft_ir_bad_arity(3.0, 1.0)
+@test_throws "must return a `CodeInfo`" gft_ir_bad_result(3.0, 1.0)

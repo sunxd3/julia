@@ -142,8 +142,12 @@ The pieces involved:
   `typeinf_ext_toplevel` on the looked-up `MethodInstance` and returns the stub with the
   resulting `CodeInstance` as its edge, its world range bounded by that instance and by
   the lookup. An interpreter that needs other code adds a method for its own type, which
-  publishes a `CodeInstance` of its own on the generated method's own `MethodInstance`
-  and returns a body that invokes it (see below).
+  returns typed IR for the generated method's own `MethodInstance` (see below).
+- For IR, `publish_transformed_ir!` types it with `ir_abstract_constant_propagation`,
+  runs the optimizer's IR passes, computes the effects with `ipo_dataflow_analysis!`,
+  and publishes the result with `publish_codeinst!` (`Compiler/src/typeinfer.jl`), the
+  tail of `finish!` for code that did not come out of an `InferenceState`. Code already
+  cached for that `MethodInstance` and owner is invoked without generating anything.
 - As a `CachedGenerator`, the stub is cached on the generated method's `MethodInstance`
   and registered as a backedge of the inner `MethodInstance`.
 - In a caller, inference resolves `invoke` with a constant `CodeInstance` to

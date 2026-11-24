@@ -760,10 +760,9 @@ function ((; code_cache)::GetNativeEscapeCache)(codeinst::Union{CodeInstance,Met
     return false
 end
 
-function refine_effects!(interp::AbstractInterpreter, opt::OptimizationState, sv::PostOptAnalysisState)
+function refine_effects!(interp::AbstractInterpreter, nargs::Int, sv::PostOptAnalysisState)
     if !is_effect_free(sv.result.ipo_effects) && sv.all_effect_free && !isempty(sv.ea_analysis_pending)
         ir = sv.ir
-        nargs = Int(opt.src.nargs)
         estate = EscapeAnalysis.analyze_escapes(ir, nargs, optimizer_lattice(interp), get_escape_cache(interp))
         argescapes = EscapeAnalysis.ArgEscapeCache(estate)
         stack_analysis_result!(sv.result, argescapes)
@@ -1063,7 +1062,12 @@ function check_inconsistentcy!(sv::PostOptAnalysisState, scanner::BBScanner)
     end
 end
 
-function ipo_dataflow_analysis!(interp::AbstractInterpreter, opt::OptimizationState,
+ipo_dataflow_analysis!(interp::AbstractInterpreter, opt::OptimizationState, ir::IRCode, result::InferenceResult) =
+    ipo_dataflow_analysis!(interp, Int(opt.src.nargs), ir, result)
+
+# Refine `result.ipo_effects` from the statement flags of `ir`, the code of a method that
+# takes `nargs` arguments.
+function ipo_dataflow_analysis!(interp::AbstractInterpreter, nargs::Int,
                                 ir::IRCode, result::InferenceResult)
     if !is_ipo_dataflow_analysis_profitable(result.ipo_effects)
         return false
@@ -1092,7 +1096,7 @@ function ipo_dataflow_analysis!(interp::AbstractInterpreter, opt::OptimizationSt
         end
     end
 
-    return refine_effects!(interp, opt, sv)
+    return refine_effects!(interp, nargs, sv)
 end
 
 # run the optimization work

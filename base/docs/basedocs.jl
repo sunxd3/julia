@@ -4325,14 +4325,18 @@ When a specialization `overdub(f, args...)` is needed in a world `world`:
 The body is produced by `Compiler.generate_transformed_body(interp, world, method, genargs)`.
 An interpreter that needs code the default cannot produce, for example code derived from
 `f` that takes other arguments or returns more than `f` does, adds a method to that
-function for its own type. Such a method builds a `CodeInstance` itself, owned by
-`Compiler.cache_owner(interp)` and stored on the specialization of the generated method
-itself, records its edges, and returns a body that `invoke`s it with the method's own
-arguments; the generated method then need not take the function to call first. The code
-is stored there and nowhere else because inference takes all code stored for one
-`MethodInstance` and owner to be the same function. Callers trust the return type,
-exception type and effects such a `CodeInstance` declares. See the documentation of that
-function for what such a method must ensure.
+function for its own type. Such a method returns typed IR (`Compiler.IRCode`) of the
+specialization of the generated method itself, together with the edges only it knows. The
+compiler types the statements left to it, optimizes the IR, and publishes it as a
+`CodeInstance` owned by `Compiler.cache_owner(interp)` on that specialization, with the
+return type and effects it finds, as it publishes inferred code; the body `invoke`s it
+with the method's own arguments, so the generated method need not take the function to
+call first. A method may also build and publish the `CodeInstance` itself and return the
+body. The code is stored on the generated method's own specialization and nowhere else
+because inference takes all code stored for one `MethodInstance` and owner to be the same
+function. Callers trust the types and flags of the IR, and the return type, exception
+type and effects of a `CodeInstance` built by hand. See the documentation of that function
+for what such a method must ensure.
 
 The body is cached like any generated body and regenerated when `ci` is invalidated, for
 example when `f` or a method it calls is redefined. Callers see the return type and
