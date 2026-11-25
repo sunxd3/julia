@@ -1023,8 +1023,10 @@ abstract type CachedGenerator end
 # by `gen(world)`, instead of running user code: the runtime calls it as it enters
 # inference (`jl_code_for_staged`), and its body is `invoke` of the result.
 struct GeneratedFunctionTransform <: CachedGenerator
+    transform # nothing, or (sig::Type) -> the signature to look up, or nothing
     gen # (world::UInt) -> Compiler.AbstractInterpreter
-    GeneratedFunctionTransform(@nospecialize(gen)) = new(gen)
+    GeneratedFunctionTransform(@nospecialize(gen)) = new(nothing, gen)
+    GeneratedFunctionTransform(@nospecialize(transform), @nospecialize(gen)) = new(transform, gen)
 end
 
 NamedTuple() = NamedTuple{(),Tuple{}}(())

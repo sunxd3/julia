@@ -45,7 +45,7 @@ end
 # are made here, around the call of the function an interpreter may add a method to, so
 # that they hold for such a method as well.
 function generated_function_transform_body(interp::AbstractInterpreter, world::UInt, source::Method,
-                                           @nospecialize(genargs::Tuple))
+                                           @nospecialize(genargs::Tuple), @nospecialize(transform=nothing))
     owner = cache_owner(interp)
     if codegen_cache(interp) === nothing
         throw(ArgumentError(LazyString("GeneratedFunctionTransform: the interpreter `", typeof(interp),
@@ -79,7 +79,7 @@ function generated_function_transform_body(interp::AbstractInterpreter, world::U
     end
     reservation = engine_reserve(mi, key)
     src = try
-        transformed_body(interp, world, source, genargs, mi)
+        transformed_body(interp, world, source, genargs, mi, transform)
     finally
         engine_reject(interp, reservation)
     end
@@ -164,14 +164,18 @@ discarded_for_output(ci::CodeInstance) = ccall(:jl_generating_output, Cint, ()) 
 # method when it met a call of it, which is the body an earlier run returned with what it
 # invokes: the same function either way.
 function transformed_body(interp::AbstractInterpreter, world::UInt, source::Method, @nospecialize(genargs::Tuple),
-                          mi::MethodInstance)
+                          mi::MethodInstance, @nospecialize(transform))
     valid_worlds = WorldRange(world, typemax(UInt))
     ci = find_typeinf_cached_ci(interp, mi, WorldRange(world), SOURCE_MODE_ABI)
     if ci === nothing || discarded_for_output(ci)
         validation_world = get_world_counter()
-        result = generate_transformed_body(interp, world, source, genargs)
-        result isa Tuple{IRCode,Union{SimpleVector,Vector{Any}}} || return result
-        ir, edges = result
+        if transform === nothing
+            result = generate_transformed_body(interp, world, source, genargs)
+            result isa Tuple{IRCode,Union{SimpleVector,Vector{Any}}} || return result
+            ir, edges = result
+        else
+            ir, edges = derive_transformed_ir(interp, world, mi, transform)
+        end
         valid_worlds = ir.valid_worlds
         ci = publish_transformed_ir!(interp, mi, ir, edges, validation_world)
     end
@@ -181,6 +185,64 @@ function transformed_body(interp::AbstractInterpreter, world::UInt, source::Meth
             mi.specTypes, ", which a package image needs to carry it (see `Compiler.may_discard_trees`)")))
     end
     return invoke_body(world, source, genargs, ci, valid_worlds, 1)
+end
+
+# The IR of the specialization `mi` of a generated method whose generator has a
+# `transform`, and the edges for what it was derived from. The compiler makes the lookup
+# and infers the code the IR is derived from, so it knows these dependencies itself: the
+# tool only maps IR to IR.
+function derive_transformed_ir(interp::AbstractInterpreter, world::UInt, mi::MethodInstance, @nospecialize(transform))
+    lookup = transform(mi.specTypes)
+    valid_worlds = WorldRange(world, typemax(UInt))
+    edges = Any[]
+    source = nothing
+    if lookup !== nothing
+        if !(lookup isa Type && lookup <: Tuple)
+            throw(ArgumentError(LazyString("GeneratedFunctionTransform: `transform` must return a signature or `nothing`, not ",
+                lookup)))
+        end
+        match, valid_worlds = findsup(lookup, method_table(interp))
+        if match === nothing
+            throw(ArgumentError(LazyString("GeneratedFunctionTransform: no unique method of the interpreter's method table matches ",
+                lookup)))
+        end
+        source_mi = specialize_method(match)
+        dep = typeinf_ext(interp, source_mi, SOURCE_MODE_NOT_REQUIRED)
+        source = typeinf_ircode(interp, source_mi, nothing)[1]
+        if !(dep isa CodeInstance && source isa IRCode)
+            throw(ArgumentError(LazyString("GeneratedFunctionTransform: inference of ", lookup, " with `",
+                typeof(interp), "` produced no code")))
+        end
+        valid_worlds = intersect(valid_worlds, WorldRange(dep.min_world, dep.max_world))
+        if !(world in valid_worlds)
+            throw(ArgumentError(LazyString("GeneratedFunctionTransform: the code for ", lookup,
+                " is not valid in world ", world)))
+        end
+        # As for a call that inference resolves by dispatch to its only match: the edge
+        # stands for the code and for the lookup that found its method.
+        push!(edges, dep)
+    end
+    ir = transform_ir(interp, mi, source)
+    if !(ir isa IRCode)
+        throw(ArgumentError(LazyString("GeneratedFunctionTransform: `transform_ir` for `", typeof(interp),
+            "` must return an `IRCode`")))
+    end
+    return IRCode(ir, valid_worlds), edges
+end
+
+"""
+    transform_ir(interp::AbstractInterpreter, mi::MethodInstance, source::Union{IRCode,Nothing}) -> IRCode
+
+Produce the typed IR of `mi`, a specialization of a method whose generator is
+`Core.GeneratedFunctionTransform(transform, gen)`, for `interp = gen(world)`. `source` is
+the optimized IR `interp` inferred for the signature `transform(mi.specTypes)`, or
+`nothing` if `transform` returned `nothing`. The compiler looked that signature up and
+inferred it, so it records the dependency on it itself; the IR returned is typed,
+optimized and published as for `generate_transformed_body`.
+"""
+function transform_ir(interp::AbstractInterpreter, mi::MethodInstance, source::Union{IRCode,Nothing})
+    throw(ArgumentError(LazyString("GeneratedFunctionTransform: `", typeof(interp),
+        "` has no method of `Compiler.transform_ir`, which a generator with a `transform` needs")))
 end
 
 # Finish `ir`, typed IR that `generate_transformed_body` returned for the specialization
